@@ -1,0 +1,39 @@
+# Spaces-deploy requirements.
+#
+# Stack (lean, free-tier friendly):
+#   - numpy / pillow / opencv-headless: image processing for feature extraction
+#   - scikit-image: GLCM + entropy texture features
+#   - onnxruntime: classifier + segmentation forward inference
+#   - requests: HF Inference Providers + Ollama HTTP clients
+#   - huggingface_hub: pulls model weights at boot from a separate Model repo
+#   - torch (CPU-only) + torchvision: only on disk so predict_image can do
+#       real Grad-CAM via PyTorch autograd on the classifiers when the .pt
+#       checkpoints are present (SPACES_DOWNLOAD_PT=1 secret enables that
+#       download). ONNX is still preferred for the forward pass; .pt is
+#       loaded lazily on the Grad-CAM path. Pulled from the dedicated CPU
+#       wheel index so we don't accidentally drag in 800+ MB of CUDA tooling.
+#
+# Not shipped (training-only or unreachable from request handlers):
+#   - tensorflow, segmentation_models_pytorch, matplotlib, monai, ...
+
+# CPU-only PyTorch wheels - much smaller than the default CUDA ones.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+numpy>=1.26,<3.0
+pillow>=10.0
+opencv-python-headless>=4.9
+scikit-image>=0.22
+scikit-learn>=1.3
+requests>=2.31
+onnx>=1.16
+onnxruntime>=1.18
+pyyaml>=6.0
+huggingface_hub>=0.24
+torch>=2.0
+torchvision>=0.15
+# MedSAM cascade refiner (Ma et al., Nat Commun 2024). ViT-B image encoder +
+# mask decoder loaded from flaviagiammarino/medsam-vit-base on first request.
+# Mandatory on every positive segmentation; transparently skips empty masks.
+transformers>=4.40
+accelerate>=0.20
+safetensors>=0.4

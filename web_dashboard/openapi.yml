@@ -1,0 +1,216 @@
+openapi: 3.0.3
+info:
+  title: NeuroLens AI - Local Dashboard API
+  version: '2.0.0'
+  description: |
+    Local HTTP API served by dashboard.py. Endpoints below match the actual
+    server implementation (not aspirational). The earlier 1.0.0 spec described
+    endpoints and response fields that the server never implemented.
+servers:
+  - url: /
+
+paths:
+  /metrics:
+    get:
+      summary: Aggregate evaluation metrics for all classifier models
+      description: |
+        Returns the per-model entry computed by load_model_metrics() in
+        dashboard.py. No query parameters. Returns metrics for cnn, transfer,
+        and vit if their respective <model>_evaluation_metrics.json files exist
+        under real_eval_fixed/, real_eval_current/, or artifacts/.
+      responses:
+        '200':
+          description: Per-model metrics map
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  $ref: '#/components/schemas/ModelEntry'
+
+  /predict:
+    post:
+      summary: Run tumor / no-tumor classification on an uploaded image
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [model, image]
+              properties:
+                model:
+                  type: string
+                  description: Classifier to run. Use 'all' to run cnn + transfer + vit.
+                  enum: [cnn, transfer, vit, all]
+                image:
+                  type: string
+                  format: binary
+                  description: PNG or JPG MRI image. DICOM/NIfTI not supported.
+      responses:
+        '200':
+          description: Prediction result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  result:
+                    oneOf:
+                      - $ref: '#/components/schemas/PredictionResult'
+                      - type: object
+                        description: Map of model_name -> PredictionResult when model=all
+                        additionalProperties:
+                          $ref: '#/components/schemas/PredictionResult'
+        '400':
+          description: Bad request (missing model or image, or unparseable form)
+        '500':
+          description: Server error during prediction
+
+  /segment:
+    post:
+      summary: Run U-Net segmentation on an uploaded image
+      description: |
+        Returns a binary tumor mask plus a coloured overlay. Backed by the
+        Attention U-Net trained in segmentation_artifacts/. Implementation lives
+        in dashboard.py via src.segmentation_torch.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image:
+                  type: string
+                  format: binary
+                threshold:
+                  type: number
+                  format: float
+                  default: 0.5
+                  description: Probability threshold for binarising the predicted mask.
+      responses:
+        '200':
+          description: Segmentation result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SegmentationResult'
+
+components:
+  schemas:
+    ModelEntry:
+      type: object
+      properties:
+        model: { type: string }
+        label: { type: string }
+        weights_found: { type: boolean }
+        metrics_found: { type: boolean }
+        metrics:
+          nullable: true
+          type: object
+          properties:
+            accuracy: { type: number, nullable: true }
+            precision: { type: number, nullable: true }
+            recall: { type: number, nullable: true }
+            f1_score: { type: number, nullable: true }
+            roc_auc: { type: number, nullable: true }
+            confusion_matrix:
+              nullable: true
+              type: object
+              properties:
+                tn: { type: integer }
+                fp: { type: integer }
+                fn: { type: integer }
+                tp: { type: integer }
+
+    PredictionResult:
+      type: object
+      properties:
+        probability:
+          type: number
+          format: float
+          description: Sigmoid output of the classifier (tumor class).
+        confidence:
+          type: number
+          format: float
+          description: Confidence in the predicted label (max of p and 1-p).
+        label:
+          type: string
+          enum: [tumor, no_tumor]
+        display_label:
+          type: string
+        weights:
+          type: string
+          description: Filename of the weights file actually loaded.
+        image:
+          type: string
+          nullable: true
+          description: data:image/png;base64,... of the uploaded input.
+        gradcam:
+          type: string
+          nullable: true
+          description: |
+            data:image/png;base64,... of the Grad-CAM overlay. Returned only
+            for cnn and transfer (vit is set to null because the hybrid ViT
+            has no single 'final conv layer' suitable for Grad-CAM).
+        error:
+          type: string
+          nullable: true
+        hint:
+          type: string
+          nullable: true
+
+    SegmentationResult:
+      type: object
+      properties:
+        success: { type: boolean }
+        model: { type: string }
+        threshold: { type: number }
+        mask:
+          type: string
+          description: data:image/png;base64,... binary mask (white = tumor).
+        overlay:
+          type: string
+          description: data:image/png;base64,... input with green tumor overlay.
+        dice:
+          type: number
+          nullable: true
+          description: Optional Dice vs. ground truth (only if 'mask' file was provided).
+        iou:
+          type: number
+          nullable: true
+        tumor_area_px:
+          type: integer
+          description: Number of predicted-positive pixels in the resized 256x256 mask.
+        error:
+          type: string
+          nullable: true
+        # 4-signal ensemble verdict (added 2026-06-03b). Sourced from the
+        # v9b advisory; v8 mask area alone no longer drives the verdict.
+        verdict:
+          type: string
+          enum: [TUMOR, no_tumor]
+          description: Final ensemble verdict. Source of truth for the UI Diagnosis card.
+        confidence:
+          type: string
+          enum: [high, low]
+          description: high if 2+ ensemble signals fired; low if only one branch of the OR.
+        rule:
+          type: string
+          description: Ensemble rule that produced the verdict, e.g. "(v9c AND sym) OR (v8 AND andi)".
+        signals_used:
+          type: string
+          description: Which signal set was available, e.g. "4-signal v9c+v8+sym+andi" or "2-signal v8+sym".
+        operating_point:
+          type: string
+          enum: [balanced, high_recall, high_specificity, fallback]
+          description: Active operating point. balanced (default) gives 97% recall / 6% FPR / 0.83 F1.
+        review_recommended:
+          type: boolean
+          description: True when the positive is low-confidence and a radiologist should review.
+        v9b_advisory:
+          type: object
+          description: Full advisory payload with per-signal scores, thresholds, and measured performance metadata.

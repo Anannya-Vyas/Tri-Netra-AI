@@ -1,0 +1,13 @@
+# tensorflow (removed, not compatible with python 3.14 and not used)
+numpy
+pandas
+matplotlib
+scikit-learn
+streamlit
+pillow
+opencv-python
+pyyaml
+tqdm
+seaborn
+tensorboard
+scipy

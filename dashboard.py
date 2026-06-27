@@ -1,0 +1,1971 @@
+import json
+import os
+import re
+import sys
+import time
+import uuid
+import gzip
+import logging
+import threading
+import urllib.parse
+import argparse
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
+from pathlib import Path
+
+from PIL import Image
+import numpy as np
+import base64
+import io
+
+# ---------------------------------------------------------------------------
+# Logging - one structured-ish line per request, sent to stdout (Spaces-friendly).
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=os.environ.get('LOG_LEVEL', 'INFO').upper(),
+    format='%(asctime)s %(levelname)s %(name)s | %(message)s',
+    stream=sys.stdout,
+)
+logger = logging.getLogger('trinetra.dashboard')
+
+# Server version surfaced via /version and X-Server-Version header. Updated
+# manually when shipping a notable change so the frontend can detect mismatches.
+SERVER_VERSION = '2.1.0-onnx'
+
+# Track when the server process started for /health uptime.
+PROCESS_START_TS = time.time()
+# TensorFlow is only needed for the legacy .h5 classifier branch (Grad-CAM
+# via tf.expand_dims). Since all current checkpoints are PyTorch .pt, TF is
+# imported lazily inside predict_image() instead of at module load. This lets
+# the dashboard run on Python builds (e.g. 3.14) where TF isn't available.
+
+ROOT_DIR = Path(__file__).resolve().parent
+WEB_DIR = ROOT_DIR / 'web_dashboard'
+# Classifiers (cnn / transfer / vit) were removed from the production
+# pipeline on 2026-06-01 (OOD recall capped at 25-47% even after
+# retraining). Replaced with a four-signal ensemble (final form shipped
+# 2026-06-03b, see src/research/v9b_advisory.py):
+#     verdict = (v9c AND symmetry) OR (v8 AND ANDi)
+# where v9c = frozen DINOv2 + JEPA predictor (the primary anomaly head)
+# and ANDi = unconditional pyramidal-noise DDPM. Measured on the
+# 246-sample expanded OOD bench:
+#     balanced        (default)   97% recall / 6%  FPR / 0.83 F1
+#     high_recall                100% recall / 14% FPR / 0.71 F1
+#     high_specificity            92% recall / 4%  FPR / 0.85 F1
+# Keep MODEL_TYPES empty so every dashboard loop that iterates the old
+# classifiers becomes a no-op without further code changes.
+MODEL_TYPES: list[str] = []
+MODEL_LABELS: dict[str, str] = {}
+ARTIFACTS_DIRS = [ROOT_DIR / 'real_eval_fixed', ROOT_DIR / 'real_eval_current', ROOT_DIR / 'artifacts']
+# Probe these in order; the first one with a best_model.pt wins.
+#  - attention_unet_v5:  SMP UNet+ResNet34, BraTS+LGG positives + Kaggle no-tumor
+#                        negatives (empty masks). Balanced 50/50 sampler, Dice+BCE
+#                        loss with positive weight, modality dropout. Eliminates
+#                        the positive bias that produced false-positive masks on
+#                        healthy brains in v3. SEE: prepare_v5_dataset.py +
+#                        src/train_segmentation_v5.py. Probed first.
+#  - attention_unet_v3:  SMP UNet+ResNet34, BraTS+LGG (real masks). micro-Dice 0.910 BraTS.
+#  - attention_unet_v2:  SMP UNet+ResNet34, LGG + Kaggle pseudo masks.
+#  - attention_unet_lgg: hand-rolled Attention U-Net, LGG only.
+#  - attention_unet:     pseudo-mask baseline (traces skull); historical reference.
+# v8 (ConvNeXt-Tiny + 384px + Tversky + Figshare-augmented dataset) is one
+# of the four ensemble signals. micro_dice 0.80, AUROC 0.94 on
+# dataset_v8/test. At threshold 0.20 + TTA the v8 mask is fed into the
+# 4-signal advisory rule `(v9c AND sym) OR (v8 AND andi)` — v8's role is
+# the area-based branch of the OR; the v9c+symmetry branch catches
+# tumors where v8 missed.
+SEGMENTATION_DIRS = [
+    ROOT_DIR / 'segmentation_artifacts' / 'attention_unet_v8',
+    ROOT_DIR / 'segmentation_artifacts' / 'attention_unet_v5',
+    ROOT_DIR / 'segmentation_artifacts' / 'attention_unet_v3',
+    ROOT_DIR / 'segmentation_artifacts' / 'attention_unet_v2',
+    ROOT_DIR / 'segmentation_artifacts' / 'attention_unet_lgg',
+    ROOT_DIR / 'segmentation_artifacts' / 'attention_unet',
+]
+
+# Per-segmentation-model default thresholds. v8 ships at 0.20 because that
+# threshold + 4-way TTA gives the best clinical operating point (FN 23%,
+# FP 0.26%). Older models keep 0.50 default for backwards compatibility.
+# Override at request time by passing `threshold` in the /segment form.
+SEGMENTATION_DEFAULT_THRESHOLD = {
+    'attention_unet_v8': 0.20,
+    'attention_unet_v5': 0.50,
+    'attention_unet_v3': 0.50,
+    'attention_unet_t1c': 0.50,
+}
+# Per-modality model overrides. /segment can request a specific specialist by
+# passing modality=<key> in the multipart form; we then load that model
+# instead of the default search. T1c specialist is trained from the BraTS T1c
+# channel triplicated as RGB (see prepare_brats_dataset.py --channels t1ce t1ce t1ce
+# and segmentation_artifacts/attention_unet_t1c/).
+MODALITY_DIRS = {
+    't1c': ROOT_DIR / 'segmentation_artifacts' / 'attention_unet_t1c',
+}
+MODEL_CACHE = {}
+SEG_CACHE = {}
+# ONNX runtime sessions, keyed by .onnx path. Separate from the PyTorch caches
+# because ONNX sessions hold GPU memory through onnxruntime, not torch's
+# allocator, so we don't want them to participate in the torch cache evictor.
+ONNX_CACHE: dict = {}
+
+# Set ONNX_DISABLE=1 to force the PyTorch path (useful for Grad-CAM-heavy
+# debugging or when you suspect an ONNX-vs-PyTorch numerical discrepancy on a
+# new export). Default: prefer ONNX whenever a .onnx sibling exists next to
+# the .pt checkpoint. Grad-CAM always falls back to PyTorch regardless of this
+# flag because ONNX has no autograd.
+USE_ONNX = os.environ.get('ONNX_DISABLE', '').strip() not in ('1', 'true', 'yes')
+
+sys.path.append(str(ROOT_DIR))
+
+
+def _resolve_segmentation_weights(modality: str | None = None):
+    """Return (weights_path, dir_name) of the model to load.
+
+    Tries .pt first (needed for PyTorch fallback paths), then .onnx (the
+    Spaces deploy state where only ONNX weights are on disk). Either is fine
+    for inference since segment_image's ONNX-preferred branch handles both.
+    """
+    def _find_in(d):
+        # v8 saves checkpoints as best_micro.pt / best_micro.onnx (highest
+        # micro_dice = headline metric). Older models use best_model.* (highest
+        # composite). Prefer the model's "headline" checkpoint when present.
+        for basename in ('best_micro', 'best_model'):
+            for ext in ('.pt', '.onnx'):
+                p = d / f'{basename}{ext}'
+                if p.exists():
+                    return p
+        return None
+    if modality and modality in MODALITY_DIRS:
+        p = _find_in(MODALITY_DIRS[modality])
+        if p is not None:
+            return p, MODALITY_DIRS[modality].name
+    for d in SEGMENTATION_DIRS:
+        p = _find_in(d)
+        if p is not None:
+            return p, d.name
+    return None, None
+
+
+def _load_segmentation_model(modality: str | None = None):
+    """Load the trained PyTorch segmentation model into the cache.
+
+    Returns (model, device, config) on success, or None if no checkpoint
+    exists for the requested modality or in the default search path.
+    Returns None for .onnx-only checkpoints (use the ONNX path instead).
+    """
+    weights_path, dir_name = _resolve_segmentation_weights(modality)
+    if weights_path is None:
+        return None
+    # .onnx files cannot be loaded with torch.load (they're protobuf, not
+    # pickle). Return None so the caller uses the ONNX inference path.
+    if weights_path.suffix == '.onnx':
+        logger.debug('_load_segmentation_model: skipping %s (ONNX file, use ONNX runtime)', weights_path)
+        return None
+    cache_key = ('seg', str(weights_path), weights_path.stat().st_mtime if weights_path.exists() else 0)
+    if cache_key in SEG_CACHE:
+        return SEG_CACHE[cache_key]
+    import torch
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    ckpt = torch.load(str(weights_path), map_location=device, weights_only=False)
+    cfg = ckpt.get('config', {}) or {}
+    cfg['_source_dir'] = dir_name  # surface which checkpoint we loaded in /segment responses
+
+    # v2 checkpoints record their SMP architecture + encoder; load via SMP.
+    # v1 checkpoints use the hand-rolled AttentionUNet.
+    architecture = ckpt.get('architecture')
+    encoder = ckpt.get('encoder')
+    if architecture and encoder:
+        import segmentation_models_pytorch as smp
+        SmpClass = getattr(smp, architecture)
+        model = SmpClass(
+            encoder_name=encoder,
+            encoder_weights=None,  # state_dict overrides weights, don't re-download ImageNet
+            in_channels=3,
+            classes=1,
+        ).to(device)
+        cfg['_normalization'] = 'imagenet'  # tell segment_image to use ImageNet mean/std
+        if 'image_size' in ckpt:
+            cfg.setdefault('image_size', int(ckpt['image_size']))
+    else:
+        from src.segmentation_torch import AttentionUNet
+        model = AttentionUNet(
+            in_channels=3,
+            base_filters=int(cfg.get('base_filters', 32)),
+            dropout=float(cfg.get('dropout', 0.2)),
+        ).to(device)
+        cfg['_normalization'] = 'rescale_255'
+    model.load_state_dict(ckpt['state_dict'])
+    model.eval()
+    # Don't clear: cascade routing wants both v3 and the T1c specialist to stay
+    # GPU-warm so the fallback path doesn't pay a second 200ms reload. ~200 MB
+    # combined VRAM, trivial on an 8 GB card. We cap the dict at 4 entries to
+    # avoid unbounded growth if more specialists are added later.
+    if len(SEG_CACHE) >= 4:
+        SEG_CACHE.pop(next(iter(SEG_CACHE)))
+    SEG_CACHE[cache_key] = (model, device, cfg)
+    return SEG_CACHE[cache_key]
+
+
+# Cascade thresholds. Two reasons to retry with the T1c specialist:
+#   AREA: v3 found <25 px of tumor (essentially nothing). True positives are
+#         routinely >500 px so <25 is just background noise.
+#   PROB: v3 returned an area but mean probability inside the mask is below
+#         this threshold, meaning v3 is "kind of" picking up something but
+#         not committing - common on Kaggle T1-contrast single-modality
+#         input where v3 (trained mostly on multi-modal stacks) gives soft
+#         predictions. T1c specialist often nails these.
+CASCADE_MIN_AREA_PX = 25
+CASCADE_MIN_MEAN_PROB = 0.65
+
+
+def _get_onnx_session(onnx_path):
+    """Return a cached onnxruntime InferenceSession for the given .onnx path.
+
+    Sessions are reused across requests (model load is the expensive part).
+    Provider preference: CUDA -> CPU. We don't enable TensorRT by default
+    because its build-time graph compilation adds 30+ seconds to the first
+    request, which would hurt the user-perceived 'first inference' latency.
+    """
+    onnx_path = str(onnx_path)
+    sess = ONNX_CACHE.get(onnx_path)
+    if sess is not None:
+        return sess
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        return None
+    providers = []
+    avail = ort.get_available_providers()
+    if 'CUDAExecutionProvider' in avail:
+        providers.append('CUDAExecutionProvider')
+    providers.append('CPUExecutionProvider')
+    so = ort.SessionOptions()
+    # Optimization level: ALL = constant folding + fusion + memory planning.
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    so.log_severity_level = 3  # silence the routine memcpy / EP warnings
+    sess = ort.InferenceSession(onnx_path, sess_options=so, providers=providers)
+    ONNX_CACHE[onnx_path] = sess
+    return sess
+
+
+def _segmentation_onnx_path(pt_path):
+    """Return the .onnx sibling if it exists. Conventional name is the same
+    basename with .onnx (produced by scripts/export_onnx.py).
+    If pt_path is already .onnx, return it directly."""
+    p = Path(pt_path)
+    if p.suffix == '.onnx' and p.exists():
+        return p
+    candidate = p.with_suffix('.onnx')
+    return candidate if candidate.exists() else None
+
+
+def _classifier_onnx_path(pt_path):
+    """Same convention for classifier .pt files (best_weights.pt -> best_weights.onnx)."""
+    p = Path(pt_path)
+    candidate = p.with_suffix('.onnx')
+    return candidate if candidate.exists() else None
+
+
+def _is_grayscale_input(image_bytes, sample_threshold: float = 1.5) -> bool:
+    """Detect single-modality (grayscale-triplicated) inputs.
+
+    Kaggle Brain Tumor MRI is single-modality T1c displayed as an RGB JPEG
+    where R == G == B per pixel. v3 was trained on multi-modal BraTS stacks
+    (T1+T1c+T2+FLAIR) where the channels carry independent information; on a
+    grayscale input v3 has no multi-modal cue and segments imperfectly. The
+    T1c specialist was trained on triplicated T1c channels and is the correct
+    primary for these inputs.
+
+    We sample the mean per-pixel channel deviation and treat anything below
+    `sample_threshold` (out of 255) as grayscale.
+    """
+    try:
+        from PIL import Image as _PIL
+        import io as _io
+        img = _PIL.open(_io.BytesIO(image_bytes)).convert('RGB').resize((64, 64))
+        arr = np.asarray(img, dtype=np.float32)
+        chan_dev = (np.abs(arr[:, :, 0] - arr[:, :, 1])
+                    + np.abs(arr[:, :, 1] - arr[:, :, 2])
+                    + np.abs(arr[:, :, 0] - arr[:, :, 2])) / 3.0
+        return float(chan_dev.mean()) < sample_threshold
+    except Exception:
+        return False
+
+
+def _build_conformal_seg_fn_batched(modality: str | None, image_size: int = 256):
+    """Like _build_conformal_seg_fn but accepts a BATCH of images.
+
+    Signature: seg_fn_batched(x: NxHxWx3 float in [0,1]) -> NxHxW float.
+    Used by the conformal-counterfactual head's fast path to run all
+    N interventions in a single ORT call (vs N sequential calls). On a
+    cpu-basic Space at N=8, this saves ~5-6 sec per scan with no
+    feature loss vs running each intervention separately.
+    Returns None when no checkpoint or when ONNX is disabled (PyTorch
+    fallback path is not batched; the slow path handles it).
+    """
+    weights_path, dir_name = _resolve_segmentation_weights(modality)
+    if weights_path is None:
+        return None
+    onnx_path = _segmentation_onnx_path(weights_path) if USE_ONNX else None
+    if onnx_path is None:
+        return None
+    sess = _get_onnx_session(onnx_path)
+    if sess is None:
+        return None
+    ms_size = 384 if dir_name == 'attention_unet_v8' else image_size
+    norm_mode = 'rescale_255' if dir_name in ('attention_unet', 'attention_unet_lgg') else 'imagenet'
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+    def seg_fn_batched(x_batch: np.ndarray) -> np.ndarray:
+        assert x_batch.ndim == 4 and x_batch.shape[-1] == 3, x_batch.shape
+        n, h, w, _ = x_batch.shape
+        if (h, w) != (ms_size, ms_size):
+            from PIL import Image as _PIL
+            resized = np.zeros((n, ms_size, ms_size, 3), dtype=np.float32)
+            for i in range(n):
+                pil = _PIL.fromarray((np.clip(x_batch[i], 0, 1) * 255).astype(np.uint8))
+                pil = pil.resize((ms_size, ms_size))
+                resized[i] = np.asarray(pil, dtype=np.float32) / 255.0
+            x_batch = resized
+        if norm_mode == 'imagenet':
+            base = (x_batch - mean) / std
+        else:
+            base = x_batch
+        xt = base.transpose(0, 3, 1, 2).astype(np.float32)  # NxCxHxW
+        logits = sess.run(None, {'input': xt})[0]
+        prob = 1.0 / (1.0 + np.exp(-logits))
+        return prob[:, 0].astype(np.float32)  # N x H x W
+    return seg_fn_batched
+
+
+def _build_conformal_seg_fn(modality: str | None, image_size: int = 256):
+    """Build a callable matching the conformal-counterfactual module's API.
+
+    Signature: seg_fn(x: HxWx3 float in [0,1]) -> HxW float in [0,1].
+    The intervention modules operate on raw pixel space (pre-normalisation),
+    so this wrapper applies the cascade-winner's normalisation internally.
+    Uses the cached ONNX session when available, PyTorch fallback otherwise.
+    Returns None if no checkpoint exists for the requested modality.
+    """
+    weights_path, dir_name = _resolve_segmentation_weights(modality)
+    if weights_path is None:
+        return None
+    onnx_path = _segmentation_onnx_path(weights_path) if USE_ONNX else None
+    norm_mode = 'rescale_255' if dir_name in ('attention_unet', 'attention_unet_lgg') else 'imagenet'
+
+    if onnx_path is not None:
+        sess = _get_onnx_session(onnx_path)
+        if sess is None:
+            onnx_path = None
+
+    if onnx_path is not None:
+        sess = _get_onnx_session(onnx_path)
+        def seg_fn(x: np.ndarray) -> np.ndarray:
+            assert x.ndim == 3 and x.shape[2] == 3, x.shape
+            arr = x
+            if arr.shape[:2] != (image_size, image_size):
+                from PIL import Image as _PIL
+                pil = _PIL.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
+                pil = pil.resize((image_size, image_size))
+                arr = np.asarray(pil, dtype=np.float32) / 255.0
+            if norm_mode == 'imagenet':
+                base = (arr - np.array([0.485, 0.456, 0.406], dtype=np.float32)) \
+                        / np.array([0.229, 0.224, 0.225], dtype=np.float32)
+            else:
+                base = arr
+            xt = base.transpose(2, 0, 1)[None].astype(np.float32)
+            logits = sess.run(None, {'input': xt})[0]
+            prob = 1.0 / (1.0 + np.exp(-logits))
+            return prob[0, 0].astype(np.float32)
+        return seg_fn
+
+    # PyTorch fallback.
+    import torch
+    loaded = _load_segmentation_model(modality=modality)
+    if loaded is None:
+        return None
+    model, device, cfg = loaded
+    image_size_pt = int(cfg.get('image_size', image_size))
+    norm_mode_pt = cfg.get('_normalization', norm_mode)
+
+    def seg_fn(x: np.ndarray) -> np.ndarray:
+        assert x.ndim == 3 and x.shape[2] == 3, x.shape
+        arr = x
+        if arr.shape[:2] != (image_size_pt, image_size_pt):
+            from PIL import Image as _PIL
+            pil = _PIL.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
+            pil = pil.resize((image_size_pt, image_size_pt))
+            arr = np.asarray(pil, dtype=np.float32) / 255.0
+        if norm_mode_pt == 'imagenet':
+            base = (arr - np.array([0.485, 0.456, 0.406], dtype=np.float32)) \
+                    / np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        else:
+            base = arr
+        t = torch.from_numpy(base.transpose(2, 0, 1)).unsqueeze(0).to(device)
+        with torch.no_grad():
+            logits = model(t)
+            prob = torch.sigmoid(logits)[0, 0].cpu().numpy()
+        return prob.astype(np.float32)
+    return seg_fn
+
+
+def _conformal_counterfactual_for(result: dict, image_bytes: bytes) -> dict | None:
+    """Optional conformal-counterfactual analysis after the cascade pick.
+
+    Wraps src.research.dashboard_integration.analyze so the dashboard
+    does not import numpy heavy machinery unless artifacts exist.
+    Returns None if calibration artifacts are missing or anything fails.
+
+    Set CONFORMAL_DISABLE=1 in the Space environment to skip this entirely
+    (saves ~6-8 sec per scan on CPU-basic; conformal panel will just show
+    "pending" hint instead of populated coverage data).
+    """
+    if os.environ.get('CONFORMAL_DISABLE', '').strip() in ('1', 'true', 'yes'):
+        return None
+    try:
+        from src.research import dashboard_integration as _cf
+    except Exception:
+        return None
+    import io as _io
+    from PIL import Image as _PIL
+    source_dir = result.get('source_dir')
+    modality = 't1c' if source_dir == 'attention_unet_t1c' else None
+    image_size = int(result.get('image_size', 256))
+    seg_fn = _build_conformal_seg_fn(modality, image_size=image_size)
+    if seg_fn is None:
+        return None
+    # Batched seg_fn for the fast path (all 8 interventions in one ORT call).
+    # Falls back to None for PyTorch path; analyze() then uses the slow loop.
+    seg_fn_batched = _build_conformal_seg_fn_batched(modality, image_size=image_size)
+    try:
+        pil_img = _PIL.open(_io.BytesIO(image_bytes)).convert('RGB').resize((image_size, image_size))
+        arr = np.asarray(pil_img, dtype=np.float32) / 255.0
+        # Recompute factual prob through the same seg_fn so it is on the
+        # same scale as the intervention outputs (single forward, no TTA).
+        # This keeps cf-vs-factual comparison apples-to-apples; the displayed
+        # primary mask still uses the full TTA path.
+        factual_prob = seg_fn(arr)
+        return _cf.analyze(
+            image_array=arr,
+            factual_prob=factual_prob,
+            seg_fn=seg_fn,
+            seg_fn_batched=seg_fn_batched,
+            threshold=float(result.get('threshold', 0.5)),
+        )
+    except Exception:
+        return None
+
+
+def _segment_one(image_bytes, threshold: float, modality: str | None):
+    """Single-model segmentation. No cascade logic. Returns the standard
+    response dict (success/mask/overlay/tumor_area_px/source_dir) or an error
+    dict if no checkpoint exists for the requested modality.
+
+    Inference backend selection:
+      - If a sibling .onnx file exists next to the resolved .pt AND USE_ONNX
+        is True, run via onnxruntime (CUDA EP if available, else CPU EP).
+        ~3x faster than PyTorch cold path, ~equal once warm.
+      - Otherwise fall back to PyTorch. The PyTorch path is also used when
+        Grad-CAM is later requested (autograd needed).
+    """
+    import io
+    import base64
+    import numpy as np
+    from PIL import Image
+
+    weights_path, dir_name = _resolve_segmentation_weights(modality)
+    # If caller passed the legacy default 0.5 but this model has a tuned
+    # default in SEGMENTATION_DEFAULT_THRESHOLD (e.g. v8 -> 0.20), use the
+    # tuned default. Explicit non-default thresholds always win.
+    if dir_name and abs(threshold - 0.5) < 1e-9:
+        tuned = SEGMENTATION_DEFAULT_THRESHOLD.get(dir_name)
+        if tuned is not None:
+            threshold = float(tuned)
+    if weights_path is None:
+        return {
+            'success': False,
+            'error': 'Segmentation weights not found.',
+            'hint': 'Run `python src/train_segmentation_torch.py` to train the Attention U-Net first.',
+        }
+
+    onnx_path = _segmentation_onnx_path(weights_path) if USE_ONNX else None
+    used_runtime = 'pytorch'
+
+    if onnx_path is not None:
+        # ONNX fast path. We don't need to load the PyTorch checkpoint at all
+        # for the forward pass; we just need the cfg-style metadata (image
+        # size, normalization). We default to the v2/v3 ImageNet stack since
+        # all current .onnx exports came from SMP UNets with that pretraining.
+        sess = _get_onnx_session(onnx_path)
+        if sess is None:
+            onnx_path = None  # onnxruntime missing -> fall through to PyTorch
+    if onnx_path is not None:
+        sess = _get_onnx_session(onnx_path)
+        # v8 ConvNeXt-Tiny was trained at 384x384; v3/v5/t1c at 256x256.
+        image_size = 384 if dir_name == 'attention_unet_v8' else 256
+        # The lgg / attention_unet baselines were trained with 0-1 rescale,
+        # the SMP-style models (v2/v3/t1c/v8) expect ImageNet normalisation.
+        norm_mode = 'rescale_255' if dir_name in ('attention_unet', 'attention_unet_lgg') else 'imagenet'
+
+        pil_img = Image.open(io.BytesIO(image_bytes)).convert('RGB').resize((image_size, image_size))
+        arr = np.asarray(pil_img, dtype=np.float32) / 255.0
+        if norm_mode == 'imagenet':
+            base = ((arr - np.array([0.485, 0.456, 0.406], dtype=np.float32))
+                    / np.array([0.229, 0.224, 0.225], dtype=np.float32))
+        else:
+            base = arr
+
+        # Test-time augmentation: average predictions across 4 geometric
+        # transforms (identity, hflip, rot180, hflip+rot180). Each transform
+        # is reversed on the output before averaging, so the mask aligns with
+        # the original image. TTA typically buys 3-5% Dice on out-of-
+        # distribution inputs at 4x inference cost (~150 ms on CUDA).
+        # Disable with TTA_DISABLE=1 for debugging.
+        use_tta = os.environ.get('TTA_DISABLE', '').strip() not in ('1', 'true', 'yes')
+        if use_tta:
+            # BATCHED TTA: stack all 4 transforms into a single batch=4 ORT
+            # call instead of 4 sequential calls. On cpu-basic this drops
+            # TTA cost from ~3-4 sec -> ~1.2-1.5 sec with no result change.
+            tta_inputs = [
+                ('id', base),
+                ('hflip', base[:, ::-1, :].copy()),
+                ('rot180', base[::-1, ::-1, :].copy()),
+                ('hflip_rot180', base[::-1, :, :].copy()),
+            ]
+            batch = np.stack([inp.transpose(2, 0, 1) for _, inp in tta_inputs],
+                              axis=0).astype(np.float32)
+            logits_batch = sess.run(None, {'input': batch})[0]  # (4, 1, H, W)
+            probs_batch = 1.0 / (1.0 + np.exp(-logits_batch))
+            prob_sum = np.zeros((image_size, image_size), dtype=np.float32)
+            for i, (tag, _) in enumerate(tta_inputs):
+                p = probs_batch[i, 0]
+                # Reverse the transform on the probability map.
+                if tag == 'hflip':
+                    p = p[:, ::-1]
+                elif tag == 'rot180':
+                    p = p[::-1, ::-1]
+                elif tag == 'hflip_rot180':
+                    p = p[::-1, :]
+                prob_sum += p
+            probs = prob_sum / float(len(tta_inputs))
+        else:
+            x_np = base.transpose(2, 0, 1)[None].astype(np.float32)
+            logits = sess.run(None, {'input': x_np})[0]
+            probs = 1.0 / (1.0 + np.exp(-logits))
+            probs = probs[0, 0]
+
+        cfg = {'_source_dir': dir_name, '_normalization': norm_mode,
+               'image_size': image_size, '_tta': use_tta}
+        used_runtime = 'onnx'
+    else:
+        # PyTorch fallback (also takes the original loading path so cfg gets
+        # populated from the checkpoint, including any custom image_size).
+        import torch
+        loaded = _load_segmentation_model(modality=modality)
+        if loaded is None:
+            return {
+                'success': False,
+                'error': 'Segmentation weights not found.',
+                'hint': 'Run `python src/train_segmentation_torch.py` first.',
+            }
+        model, device, cfg = loaded
+        image_size = int(cfg.get('image_size', 256))
+        pil_img = Image.open(io.BytesIO(image_bytes)).convert('RGB').resize((image_size, image_size))
+        arr = np.asarray(pil_img, dtype=np.float32) / 255.0
+        if cfg.get('_normalization') == 'imagenet':
+            norm = arr.copy()
+            norm = (norm - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / \
+                    np.array([0.229, 0.224, 0.225], dtype=np.float32)
+            x = torch.from_numpy(norm.transpose(2, 0, 1)).unsqueeze(0).to(device)
+        else:
+            x = torch.from_numpy(arr.transpose(2, 0, 1)).unsqueeze(0).to(device)
+        with torch.no_grad():
+            logits = model(x)
+            probs = torch.sigmoid(logits)[0, 0].cpu().numpy()
+
+    mask_bin = (probs >= float(threshold)).astype(np.uint8) * 255
+    # Largest-component filter: drop small spurious blobs that often appear
+    # on out-of-distribution inputs (Kaggle T1-contrast scans). Keep only
+    # components whose area is at least KEEP_FRACTION of the largest one.
+    # Off when LARGEST_COMPONENT_FILTER_OFF=1 (debug).
+    if os.environ.get('LARGEST_COMPONENT_FILTER_OFF', '').strip() not in ('1', 'true', 'yes'):
+        try:
+            import cv2 as _cv2
+            n, labels, stats, _c = _cv2.connectedComponentsWithStats(mask_bin, connectivity=8)
+            if n > 2:  # 0 is background, 1+ are foreground components
+                areas = stats[1:, _cv2.CC_STAT_AREA]
+                if areas.size:
+                    keep_floor = max(int(0.10 * areas.max()), 5)
+                    cleaned = np.zeros_like(mask_bin)
+                    for i in range(1, n):
+                        if stats[i, _cv2.CC_STAT_AREA] >= keep_floor:
+                            cleaned[labels == i] = 255
+                    mask_bin = cleaned
+        except Exception:
+            pass
+    tumor_area_px = int((mask_bin > 0).sum())
+
+    rgb = (arr * 255).astype(np.uint8)
+    overlay = rgb.copy()
+    alpha_mask = (mask_bin > 0)
+    if alpha_mask.any():
+        overlay[alpha_mask] = (0.4 * np.array([34, 197, 94], dtype=np.uint8) + 0.6 * overlay[alpha_mask]).astype(np.uint8)
+
+    def _encode_png(np_img):
+        buf = io.BytesIO()
+        Image.fromarray(np_img).save(buf, format='PNG')
+        return 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode('utf-8')
+
+    # Mean probability inside the predicted mask - useful for cascade
+    # tie-breaking and for confidence display in the UI.
+    if tumor_area_px > 0:
+        mean_prob = float(probs[probs >= float(threshold)].mean())
+    else:
+        mean_prob = float(probs.max())  # what was the best we could do?
+
+    return {
+        'success': True,
+        'model': 'attention_unet',
+        'source_dir': cfg.get('_source_dir', 'attention_unet'),
+        'runtime': used_runtime,  # 'onnx' (preferred) or 'pytorch' (fallback)
+        'threshold': float(threshold),
+        'image_size': image_size,
+        'mask': _encode_png(mask_bin),
+        'overlay': _encode_png(overlay),
+        'tumor_area_px': tumor_area_px,
+        'mean_prob_in_mask': mean_prob,
+        # Image-wide max probability — confidence_tier() in
+        # src/research/view_router uses this as the strongest TP-vs-FP
+        # separator (AUC ~0.91 measured on ID + OOD).
+        'max_prob_in_image': float(probs.max()),
+        'dice': None,
+        'iou': None,
+    }
+
+
+def _maybe_attach_conformal(result: dict, image_bytes: bytes) -> dict:
+    """Attach conformal-counterfactual analysis to a successful segmentation."""
+    if not result.get('success'):
+        return result
+    cf = _conformal_counterfactual_for(result, image_bytes)
+    if cf is not None:
+        result['conformal_counterfactual'] = cf
+    return result
+
+
+def _maybe_apply_medsam_refiner(result: dict, image_bytes: bytes) -> dict:
+    """Run MedSAM-as-refiner on the cascade winner.
+
+    The joint-trained segmenter (v5/v7) handles localization + FP
+    discipline; MedSAM redraws the boundary at SAM ViT-B resolution
+    when prompted with the bbox of the largest connected component.
+    Realistic gain: +3-5 micro-Dice points on tumor scans, zero impact
+    on no-tumor scans (refiner skips empty coarse masks).
+
+    MANDATORY on every successful segmentation. No env-flag gate. The
+    refiner is internally safe on empty masks: when the coarse mask
+    has fewer than 16 pixels of tumor (i.e. classifier consensus is
+    almost certainly no-tumor, or v5 found nothing), it returns the
+    coarse mask unchanged with skipped_reason=empty_coarse_mask. So
+    no-tumor scans are never refined - we never invent tumor where
+    the joint-trained segmenter said there was none. Set
+    MEDSAM_REFINER_DISABLE=1 only for debugging.
+
+    Failure is silent: if MedSAM isn't installed or its forward pass
+    throws, we return the original result unchanged with a diagnostic
+    `medsam_refiner.available=False` field for visibility in the UI.
+    """
+    if os.environ.get('MEDSAM_REFINER_DISABLE', '').strip() in ('1', 'true', 'yes'):
+        return result
+    if not result.get('success'):
+        return result
+    try:
+        import io as _io
+        import base64 as _b64
+        from PIL import Image as _PIL
+        from src.research.medsam_refiner import MedSAMRefiner
+    except Exception as exc:
+        result['medsam_refiner'] = {'enabled': True, 'available': False,
+                                      'reason': f'import_failed: {exc}'}
+        return result
+    try:
+        image_size = int(result.get('image_size', 256))
+        pil_img = _PIL.open(_io.BytesIO(image_bytes)).convert('RGB').resize((image_size, image_size))
+        rgb = np.asarray(pil_img, dtype=np.uint8)
+        # Decode the cascade mask (data URL -> uint8 array -> bool).
+        mask_url = result.get('mask') or ''
+        if not mask_url.startswith('data:image/png;base64,'):
+            result['medsam_refiner'] = {'enabled': True, 'available': False,
+                                          'reason': 'no_mask_to_refine'}
+            return result
+        mask_png = _b64.b64decode(mask_url.split(',', 1)[1])
+        coarse = np.array(_PIL.open(_io.BytesIO(mask_png)).convert('L').resize(
+            (image_size, image_size), _PIL.NEAREST,
+        ))
+        coarse_bool = coarse > 127
+        refined = MedSAMRefiner.get().refine(rgb, coarse_bool)
+        # Re-encode refined + overlay back into data URLs so the UI swaps in.
+        refined_u8 = (refined.refined_mask.astype(np.uint8) * 255)
+        overlay = rgb.copy()
+        if refined.refined_mask.any():
+            overlay[refined.refined_mask] = (
+                0.4 * np.array([34, 197, 94], dtype=np.uint8)
+                + 0.6 * overlay[refined.refined_mask]
+            ).astype(np.uint8)
+
+        def _enc(arr_u8):
+            buf = _io.BytesIO()
+            _PIL.fromarray(arr_u8).save(buf, format='PNG')
+            return 'data:image/png;base64,' + _b64.b64encode(buf.getvalue()).decode('utf-8')
+
+        # Stash the coarse outputs so the UI can show "before/after".
+        result['coarse_mask'] = result.get('mask')
+        result['coarse_overlay'] = result.get('overlay')
+        result['coarse_tumor_area_px'] = result.get('tumor_area_px')
+        # Promote refined as the canonical mask/overlay.
+        result['mask'] = _enc(refined_u8)
+        result['overlay'] = _enc(overlay)
+        result['tumor_area_px'] = int(refined.refiner_area_px)
+        # Bbox-prompt visualization: draw the bbox as a yellow rectangle
+        # outline on top of the original MRI. Useful for "see exactly what
+        # MedSAM was told to focus on" debugging.
+        bbox_overlay_url = None
+        if refined.bbox_used is not None:
+            bbox_viz = rgb.copy()
+            x0, y0, x1, y1 = refined.bbox_used
+            x0 = max(0, int(x0)); y0 = max(0, int(y0))
+            x1 = min(rgb.shape[1] - 1, int(x1)); y1 = min(rgb.shape[0] - 1, int(y1))
+            border = max(1, min(3, (x1 - x0) // 40))  # 3px on a typical 256-512 image
+            color = np.array([255, 215, 0], dtype=np.uint8)  # gold yellow
+            if x1 > x0 and y1 > y0:
+                bbox_viz[y0:y0 + border, x0:x1] = color
+                bbox_viz[max(0, y1 - border):y1, x0:x1] = color
+                bbox_viz[y0:y1, x0:x0 + border] = color
+                bbox_viz[y0:y1, max(0, x1 - border):x1] = color
+                # Small label tag in upper-left of bbox
+                tag_h, tag_w = 16, 80
+                ty0 = max(0, y0 - tag_h - 1)
+                ty1 = ty0 + tag_h
+                tx0 = x0
+                tx1 = min(rgb.shape[1], x0 + tag_w)
+                bbox_viz[ty0:ty1, tx0:tx1] = (
+                    0.5 * bbox_viz[ty0:ty1, tx0:tx1] + 0.5 * color
+                ).astype(np.uint8)
+            bbox_overlay_url = _enc(bbox_viz)
+
+        result['medsam_refiner'] = {
+            'enabled': True,
+            'available': True,
+            'model': 'flaviagiammarino/medsam-vit-base',
+            'iou_score': float(refined.score),
+            'coarse_area_px': int(refined.coarse_area_px),
+            'refined_area_px': int(refined.refiner_area_px),
+            'delta_area_px': int(refined.delta_area_px),
+            'bbox_used': list(refined.bbox_used) if refined.bbox_used else None,
+            'bbox_overlay': bbox_overlay_url,
+            'elapsed_ms': float(refined.elapsed_ms),
+            'skipped_reason': refined.skipped_reason,
+        }
+    except Exception as exc:
+        result['medsam_refiner'] = {'enabled': True, 'available': False,
+                                      'reason': f'refine_failed: {exc}'}
+    return result
+
+
+def segment_image(image_bytes, threshold=0.5, modality: str | None = None,
+                    enable_v3_fallback: bool = False):
+    """Cascading segmentation.
+
+    Routing rules:
+      - modality='t1c' (or any other explicit key): user picked a specialist
+        directly. No cascade. Return that model's output as-is. Honors the
+        principle "respect the explicit user choice".
+      - modality is None (default UI path): run v3 first. If v3 returns
+        fewer than CASCADE_MIN_AREA_PX tumor pixels (i.e. it found nothing)
+        AND the T1c specialist checkpoint exists, retry with T1c. Return
+        whichever model actually found tumor. Both empty -> return v3.
+
+    The response is augmented with a `cascade` field describing what fired:
+      {
+        "used": "<dir name of model returned>",
+        "tried": ["attention_unet_v3", "attention_unet_t1c"],
+        "primary_area_px": <int>,
+        "specialist_area_px": <int>,
+        "reason": "<why the cascade triggered, or 'not_triggered'>"
+      }
+    """
+    # Explicit modality: skip cascade entirely. Honor user pick.
+    if modality:
+        result = _segment_one(image_bytes, threshold, modality=modality)
+        if result.get('success'):
+            result['cascade'] = {
+                'used': result.get('source_dir'),
+                'tried': [result.get('source_dir')],
+                'reason': 'explicit_modality_request',
+            }
+        return _maybe_attach_conformal(_maybe_apply_medsam_refiner(result, image_bytes), image_bytes)
+
+    # Default path: v5 (joint-trained, positives+negatives) is the canonical
+    # primary. When v5 returns an empty mask we run a small staged fallback
+    # to catch false negatives without re-introducing healthy-brain FPs:
+    #   1. v5 @ threshold 0.5  (default)
+    #   2. v5 @ threshold 0.3  (lower bar; catches faint enhancement)
+    #   3. v3 @ threshold 0.5  (legacy high-Dice model; its FPs are gated by
+    #                           the classifier consensus at the UI layer, so
+    #                           we only pay this cost when classifiers say
+    #                           tumor anyway - the empty-mask cases.)
+    grayscale_detected = _is_grayscale_input(image_bytes)
+    MIN_AREA = 16  # below this we treat as "empty mask"
+    cascade_tried = []
+    cascade_reasons = []
+
+    def _try(modality_or_none, thr, tag):
+        r = _segment_one(image_bytes, thr, modality=modality_or_none)
+        cascade_tried.append({
+            'tag': tag, 'source_dir': r.get('source_dir'),
+            'threshold': thr, 'area_px': int(r.get('tumor_area_px', 0) or 0),
+            'mean_prob': float(r.get('mean_prob_in_mask') or 0.0),
+            'success': bool(r.get('success')),
+        })
+        return r
+
+    primary = _try(None, threshold, f'v5_thr_{threshold:.2f}')
+    if not primary.get('success'):
+        return primary
+    primary_area = int(primary.get('tumor_area_px', 0))
+
+    # Stage 2: lower threshold retry on v5 if first attempt was empty.
+    chosen = primary
+    if primary_area < MIN_AREA:
+        cascade_reasons.append(f'v5_empty_at_{threshold:.2f}_retrying_lower')
+        retry = _try(None, max(0.30, threshold - 0.20), 'v5_thr_0.30')
+        if retry.get('success') and int(retry.get('tumor_area_px', 0)) >= MIN_AREA:
+            chosen = retry
+            cascade_reasons.append(f'v5_recovered_at_lower_threshold')
+
+    # Stage 3: v3 fallback if v5 still empty. ONLY runs when caller
+    # explicitly asks for it (build_explanation passes enable_v3_fallback=True
+    # only after computing a positive classifier consensus). v3 has no FP
+    # discipline, so we never want to run it on a healthy brain - the
+    # classifier verdict is the gate.
+    if int(chosen.get('tumor_area_px', 0)) < MIN_AREA and enable_v3_fallback:
+        v3_present = False
+        v3_dir_path = Path('segmentation_artifacts/attention_unet_v3')
+        for ext in ('best_model.pt', 'best_model.onnx'):
+            if (v3_dir_path / ext).exists():
+                v3_present = True
+                break
+        if v3_present:
+            cascade_reasons.append('classifier_verdict_tumor_but_v5_empty_at_all_thresholds_falling_back_to_v3')
+            MODALITY_DIRS['v3'] = v3_dir_path
+            v3 = _try('v3', threshold, 'v3_thr_0.50')
+            if v3.get('success') and int(v3.get('tumor_area_px', 0)) >= MIN_AREA:
+                chosen = v3
+                cascade_reasons.append('v3_recovered')
+    elif int(chosen.get('tumor_area_px', 0)) < MIN_AREA:
+        # Empty mask + no classifier signal yet to enable v3 fallback.
+        # build_explanation will re-call us with enable_v3_fallback=True
+        # if classifier consensus comes back positive.
+        cascade_reasons.append('v5_empty_v3_fallback_disabled_pending_classifier_verdict')
+
+    primary_area = int(chosen.get('tumor_area_px', 0))
+    primary_mean_prob = float(chosen.get('mean_prob_in_mask') or 0.0)
+    chosen['_grayscale_input'] = grayscale_detected
+    chosen['cascade'] = {
+        'used': chosen.get('source_dir'),
+        'tried': cascade_tried,
+        'primary_area_px': primary_area,
+        'primary_mean_prob': primary_mean_prob,
+        'specialist_area_px': None,
+        'reason': '; '.join(cascade_reasons) if cascade_reasons else f'v5_primary_at_{threshold:.2f}',
+        'grayscale_input': grayscale_detected,
+    }
+    return _maybe_attach_conformal(_maybe_apply_medsam_refiner(chosen, image_bytes), image_bytes)
+
+
+def build_explanation(image_bytes, *, threshold=0.5, modality=None, backend=None,
+                       modality_channels=None):
+    """End-to-end pipeline behind /explain.
+
+    Steps:
+      1. /segment on the upload (PyTorch UNet, T1c specialist if modality='t1c').
+      2. /predict on all 3 classifiers (cnn, transfer, vit) - reuses the cached
+         models. Pulls back probability + Grad-CAM heatmap.
+      3. Deterministic feature extraction via src.tumor_explainability so the
+         LLM sees real numbers (area, eccentricity, GLCM, multimodal hints).
+      4. LLM call via src.llm_explain. Backend selection is automatic:
+         ollama -> anthropic -> openai -> deterministic local narrative.
+    """
+    import io as _io
+    import base64 as _b64
+    from PIL import Image as _PIL
+
+    # --- 1) Segmentation ----------------------------------------------------
+    seg = segment_image(image_bytes, threshold=threshold, modality=modality)
+    if not seg.get('success'):
+        return {'success': False, 'error': seg.get('error', 'segmentation failed'),
+                'stage': 'segmentation', 'segmentation': seg}
+
+    image_size = int(seg.get('image_size', 256))
+    pil_img = _PIL.open(_io.BytesIO(image_bytes)).convert('RGB').resize((image_size, image_size))
+    image_rgb = np.asarray(pil_img, dtype=np.uint8)
+
+    def _decode_data_url(data_url):
+        if not data_url:
+            return None
+        head, _, b64 = data_url.partition(',')
+        try:
+            raw = _b64.b64decode(b64)
+        except Exception:
+            return None
+        return np.asarray(_PIL.open(_io.BytesIO(raw)).convert('RGB'), dtype=np.uint8)
+
+    overlay_rgb = _decode_data_url(seg.get('overlay'))
+    mask_rgb = _decode_data_url(seg.get('mask'))
+    if mask_rgb is None:
+        return {'success': False, 'error': 'segment did not return a mask',
+                'stage': 'segmentation', 'segmentation': seg}
+    mask_bin = (mask_rgb[..., 0] > 127).astype(np.uint8)
+
+    # --- 2) Classifier ensemble REMOVED -----------------------------------
+    # 2026-06-01: the 3-classifier ensemble (cnn / transfer / vit) was
+    # deprecated (OOD recall capped at 25-47% even after retraining).
+    # Replaced as of 2026-06-03b by a four-signal anomaly-detection
+    # ensemble combining v9c (frozen DINOv2 + JEPA predictor) with ANDi
+    # (pyramidal-noise DDPM), the v8 mask, and a deterministic symmetry
+    # score. See src/research/v9b_advisory.py for the rule and operating
+    # points. Grad-CAM is also gone since it depended on the classifier
+    # backbones; the advisory's signal-level firing breakdown serves the
+    # same diagnostic role at the ensemble layer.
+    classifier_results: dict = {}    # always empty; downstream stays compatible
+    gradcam_for_features = None       # no classifier -> no Grad-CAM
+
+    # --- 2b) View-aware threshold for v8 mask -----------------------------
+    # Detects axial / sagittal / coronal from brain geometry and applies
+    # a per-view threshold to the v8 segmentation. v8 is no longer the
+    # sole verdict source — it's one of the four signals consumed by the
+    # advisory below — but the view-aware threshold still produces the
+    # cleanest per-view mask area we feed into the ensemble.
+    view_aware_disabled = os.environ.get(
+        'VIEW_AWARE_CASCADE_DISABLE', '0').strip().lower() in ('1', 'true', 'yes')
+    view_info = None
+    if not view_aware_disabled and image_rgb is not None:
+        try:
+            from src.research.view_router import detect_view
+            view_info = detect_view(image_rgb, modality_hint=modality)
+            seg['view_detection'] = {
+                'view': view_info.view,
+                'confidence': view_info.confidence,
+                'threshold_recommended': view_info.threshold,
+                'reason': view_info.reason,
+            }
+        except Exception:
+            view_info = None
+
+    # --- 2b+) v9b Tier-2 advisory (4-signal ensemble) --------------------
+    # Updated 2026-06-03b after ANDi (unconditional pyramidal-noise DDPM,
+    # Frotscher et al. 2024) trained on 31k healthy slices added a 4th
+    # complementary signal. The 4-signal rule
+    #     (v9c AND sym) OR (v8 AND andi)
+    # broke the 95/10 OOD target decisively:
+    #
+    # Operating points (V9B_OPERATING_POINT env var, default = high_recall):
+    #   high_recall       100% recall / 14% FPR / 0.71 F1   << can't slip a tumor
+    #   balanced           97% recall /  6% FPR / 0.83 F1
+    #   high_specificity   92% recall /  4% FPR / 0.85 F1
+    # All measured on samples/ood/eval_v9c_ensemble_inputs.csv +
+    # eval_v9b_andi_results.csv (n=246, 36 tumor / 210 healthy,
+    # LOSO-valid on Navoneel).
+    #
+    # Signal opt-in toggles + weight fetches:
+    #   V9C_ENABLE=1 + V9C_DOWNLOAD=1            v9c (frozen DINOv2 + JEPA, 340 MB)
+    #   V9B_ANDI_ENABLE=1 + V9B_ANDI_DOWNLOAD=1  ANDi DDPM (16 MB)
+    # When only v9c is on: falls back to the 3-signal rule shipped 2026-06-03.
+    # When only ANDi is on: substitutes ANDi for v9c in the same logical
+    # position. When neither is on: 2-signal (v8 AND symmetry) fallback.
+    # Legacy v9b JEPA+DDPM stays behind V9B_HEAVY=1 for research only.
+    v9b = None
+    if image_rgb is not None:
+        try:
+            from src.research.v9b_advisory import compute_advisory
+            v8_area_px = int(seg.get('tumor_area_px', 0) or 0)
+            v9b = compute_advisory(image_rgb, v8_area_px=v8_area_px)
+            if v9b is not None:
+                seg['v9b_advisory'] = v9b
+                # The advisory IS the verdict now. We still surface v8
+                # alongside (clinicians read the mask directly) but the
+                # ensemble decides TUMOR vs no_tumor — that's what gives
+                # us 97% recall / 6% FPR instead of v8-alone's ~47%/10%
+                # at the same operating point. If the advisory's positive
+                # is low-confidence (only one branch of the OR fired),
+                # raise the review flag so the radiologist examines it.
+                if v9b.get('review_recommended'):
+                    seg['requires_human_review'] = True
+                    seg.setdefault('requires_human_review_reason',
+                        f'Only one detector branch fired, so this is a low-confidence '
+                        f'positive. A radiologist should review the scan to rule out '
+                        f'a false alarm (currently running in '
+                        f'"{v9b.get("operating_point_display", "Balanced")}" mode).')
+        except Exception as exc:
+            seg['v9b_advisory'] = {'enabled': False, 'reason': f'wire-up failed: {exc}'}
+
+    # Mask is never suppressed in seg-only mode. If v8 produced a mask,
+    # we show it. Production verdict = does mask have >=50 px.
+    seg['mask_suppressed'] = False
+    seg['classifier_ensemble_removed'] = True
+
+    # --- 2c) Confidence tier (segmentation-only inputs) -------------------
+    # Same rule as before but the classifier_mean_p argument is None now,
+    # so the tier depends purely on v8's max prob + area.
+    if not view_aware_disabled:
+        seg_area_total = int(seg.get('tumor_area_px', 0) or 0)
+        if seg_area_total >= 50:
+            try:
+                from src.research.view_router import confidence_tier
+                tier = confidence_tier(
+                    seg_max_prob=float(seg.get('max_prob_in_image') or 0.0),
+                    seg_area_at_view_thresh=seg_area_total,
+                    classifier_mean_p=None,   # no classifier signal in seg-only mode
+                )
+                seg['confidence_tier'] = tier
+                if tier == 'requires_review':
+                    seg['requires_human_review'] = True
+                    seg['requires_human_review_reason'] = (
+                        'low_confidence_positive: v8 seg_max < 0.75 or '
+                        'small mask. Flagged for radiologist review.'
+                    )
+            except Exception:
+                pass
+
+    # --- 3) Deterministic feature extraction --------------------------------
+    try:
+        from src.tumor_explainability import extract_all_features
+        features = extract_all_features(
+            image_rgb=image_rgb,
+            mask_bin=mask_bin,
+            pixel_spacing_mm=0.115,
+            classifier_results=classifier_results,   # always {} now
+            gradcam_heatmap=gradcam_for_features,    # always None now
+            multimodal_channels=modality_channels,
+        )
+    except Exception as exc:
+        features = {'_error': f'feature extraction failed: {exc}'}
+
+    # --- 4) LLM explanation -------------------------------------------------
+    # Evict PyTorch models from GPU before the LLM call. Background:
+    #   - empty_cache() alone only releases the *unused* cached allocator pages,
+    #     not the weight tensors. With ~5 PyTorch models hot (2 UNets + 3
+    #     classifiers) we permanently pin ~3 GiB, which leaves Qwen2.5-VL with
+    #     too little headroom for its own weights + KV cache.
+    #   - Physically dropping the cache entries -> models are garbage-collected
+    #     -> empty_cache() then reclaims everything they held. The next /predict
+    #     or /segment call reloads from disk (~200-500ms one-time cost) but
+    #     warms the cache again. Acceptable trade for getting a 6+ GiB VL model
+    #     to fit alongside our PyTorch stack on an 8 GB card.
+    try:
+        import gc as _gc
+        import torch as _torch
+        SEG_CACHE.clear()
+        MODEL_CACHE.clear()
+        _gc.collect()
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache()
+            _torch.cuda.synchronize()
+    except Exception:
+        pass
+
+    try:
+        from src.llm_explain import explain as llm_explain_call
+        explanation = llm_explain_call(
+            image_rgb=image_rgb,
+            mask_bin=mask_bin,
+            overlay_rgb=overlay_rgb,
+            classifier_results=classifier_results,
+            gradcam_rgb=_decode_data_url(seg.get('overlay')),
+            features=features,
+            modality_channels=modality_channels,
+            backend=backend,
+            advisory=v9b,
+        )
+    except Exception as exc:
+        explanation = {
+            'backend': 'none', 'model': '',
+            'summary': f'LLM call failed ({exc}); returning deterministic features only.',
+            'findings': {}, 'differential_diagnosis_hints': [],
+            'model_agreement_analysis': '', 'confidence_assessment': '',
+            'disclaimer': 'Not a medical diagnosis. Research / educational only.',
+            'raw_features': features,
+        }
+
+    # Top-level verdict block. Source of truth = the 4-signal advisory
+    # when available; fall back to the v8-area gate when it isn't.
+    # Keeping seg['v9b_advisory'] intact for callers that want every
+    # signal-level field, but the simplified verdict/confidence/rule
+    # surface up front so the UI doesn't need to drill in.
+    if v9b is not None:
+        verdict_top = v9b.get('verdict', 'no_tumor')
+        confidence_top = v9b.get('confidence', 'low')
+        rule_top = v9b.get('rule', 'ensemble')
+        signals_used_top = v9b.get('signals_used', 'unknown')
+        operating_point_top = v9b.get('operating_point', 'balanced')
+        review_recommended_top = bool(v9b.get('review_recommended', False))
+    else:
+        verdict_top = 'TUMOR' if int(seg.get('tumor_area_px', 0) or 0) >= 50 else 'no_tumor'
+        confidence_top = 'low' if seg.get('confidence_tier') == 'requires_review' else 'high'
+        rule_top = 'Tumor Outline Drawer found >= 50 pixels of tumor area'
+        signals_used_top = '1 detector active: Tumor Outline Drawer'
+        operating_point_top = 'fallback'
+        review_recommended_top = False
+
+    return {
+        'success': True,
+        'verdict': verdict_top,
+        'confidence': confidence_top,
+        'rule': rule_top,
+        'signals_used': signals_used_top,
+        'operating_point': operating_point_top,
+        'review_recommended': review_recommended_top,
+        'segmentation': seg,
+        'classifiers': classifier_results,
+        'features': features,
+        'explanation': explanation,
+    }
+
+
+def find_weights_path(model_name):
+    """Search artifact directories for a usable classifier weights file.
+
+    Three-pass search:
+      1. Any .pt in any directory wins outright (best for Grad-CAM since the
+         PyTorch graph is needed for autograd).
+      2. Any .onnx (Spaces deploy path - we ship only ONNX into the container).
+         Returned with .onnx suffix so the caller knows to skip the PyTorch
+         load path; predict_image already prefers ONNX when both exist.
+      3. Fall back to .h5 only if neither exists. The upstream .h5 files in
+         real_eval_fixed/ etc. are Git LFS pointer stubs (134 bytes) that
+         h5py rejects with 'file signature not found'.
+    """
+    # Pass 1: any .pt
+    for artifacts_dir in ARTIFACTS_DIRS:
+        model_dir = artifacts_dir / model_name
+        if not model_dir.exists():
+            continue
+        explicit_pt = model_dir / 'best_weights.pt'
+        if explicit_pt.exists():
+            return explicit_pt
+        for candidate in model_dir.glob('*.pt'):
+            return candidate
+    # Pass 2: any .onnx (Spaces deploy)
+    for artifacts_dir in ARTIFACTS_DIRS:
+        model_dir = artifacts_dir / model_name
+        if not model_dir.exists():
+            continue
+        explicit_onnx = model_dir / 'best_weights.onnx'
+        if explicit_onnx.exists():
+            return explicit_onnx
+        for candidate in model_dir.glob('*.onnx'):
+            return candidate
+    # Pass 3: any .h5 (skip LFS pointer stubs that are <1 KB)
+    for artifacts_dir in ARTIFACTS_DIRS:
+        model_dir = artifacts_dir / model_name
+        if not model_dir.exists():
+            continue
+        for candidate in [
+            model_dir / 'best_weights.weights.h5',
+            model_dir / 'best_weights.h5',
+        ]:
+            if candidate.exists() and candidate.stat().st_size > 1024:
+                return candidate
+        for candidate in model_dir.glob('*.weights.h5'):
+            if candidate.stat().st_size > 1024:
+                return candidate
+    return None
+
+
+def summarize_metrics(metrics):
+    """Normalise the per-model evaluation_metrics.json into the dashboard's
+    summary shape. Supports two on-disk formats:
+
+      A. PyTorch retrainer (retrain_classifiers_torch.py):
+         {"val": {"accuracy": .., "precision": .., "roc_auc": ..,
+                  "confusion_matrix": {"tn": .., "fp": .., "fn": .., "tp": ..}},
+          "test": {...}}    -- we prefer test if present, else val.
+
+      B. Legacy TF evaluator (src/evaluate.py):
+         {"classification_report": {"accuracy": .., "weighted avg": {...}},
+          "confusion_matrix": [[tn,fp],[fn,tp]], "roc_auc": ..}
+    """
+    if not isinstance(metrics, dict):
+        return None
+
+    # Format A: nested under 'val'/'test'.
+    if 'test' in metrics or 'val' in metrics:
+        chosen = metrics.get('test') or metrics.get('val')
+        if not isinstance(chosen, dict):
+            return None
+        cm = chosen.get('confusion_matrix')
+        confusion = None
+        if isinstance(cm, dict) and all(k in cm for k in ('tn', 'fp', 'fn', 'tp')):
+            confusion = {k: int(cm[k]) for k in ('tn', 'fp', 'fn', 'tp')}
+        return {
+            'accuracy': float(chosen['accuracy']) if chosen.get('accuracy') is not None else None,
+            'precision': float(chosen['precision']) if chosen.get('precision') is not None else None,
+            'recall': float(chosen['recall']) if chosen.get('recall') is not None else None,
+            'f1_score': float(chosen['f1']) if chosen.get('f1') is not None else None,
+            'roc_auc': float(chosen['roc_auc']) if chosen.get('roc_auc') is not None else None,
+            'confusion_matrix': confusion,
+        }
+
+    # Format B: legacy TF.
+    report = metrics.get('classification_report', {})
+    accuracy = metrics.get('accuracy')
+    if isinstance(report, dict):
+        accuracy = accuracy or report.get('accuracy')
+        weighted = report.get('weighted avg', report.get('weighted_avg', {}))
+        matrix = metrics.get('confusion_matrix')
+        confusion = None
+        if isinstance(matrix, list) and len(matrix) == 2 and all(isinstance(row, list) and len(row) == 2 for row in matrix):
+            confusion = {
+                'tn': int(matrix[0][0]),
+                'fp': int(matrix[0][1]),
+                'fn': int(matrix[1][0]),
+                'tp': int(matrix[1][1]),
+            }
+        return {
+            'accuracy': float(accuracy) if accuracy is not None else None,
+            'precision': float(weighted.get('precision')) if weighted.get('precision') is not None else None,
+            'recall': float(weighted.get('recall')) if weighted.get('recall') is not None else None,
+            'f1_score': float(weighted.get('f1-score', weighted.get('f1_score'))) if weighted.get('f1-score', weighted.get('f1_score')) is not None else None,
+            'roc_auc': float(metrics.get('roc_auc')) if metrics.get('roc_auc') is not None else None,
+            'confusion_matrix': confusion,
+        }
+    return None
+
+
+def load_model_metrics():
+    data = {}
+    for model_name in MODEL_TYPES:
+        metrics_path = next(
+            (artifacts_dir / f'{model_name}_evaluation_metrics.json'
+             for artifacts_dir in ARTIFACTS_DIRS
+             if (artifacts_dir / f'{model_name}_evaluation_metrics.json').exists()),
+            None,
+        )
+        model_entry = {
+            'model': model_name,
+            'label': MODEL_LABELS[model_name],
+            'weights_found': bool(find_weights_path(model_name)),
+            'metrics_found': False,
+            'metrics': None,
+        }
+        if metrics_path and metrics_path.exists():
+            try:
+                with metrics_path.open('r', encoding='utf-8') as fh:
+                    metrics = json.load(fh)
+                model_entry['metrics'] = summarize_metrics(metrics)
+                model_entry['metrics_found'] = model_entry['metrics'] is not None
+            except Exception:
+                model_entry['metrics_found'] = False
+        data[model_name] = model_entry
+    return data
+
+
+def predict_image(model_name, image_bytes):
+    """REMOVED. Classifier ensemble (cnn/transfer/vit) was deprecated on
+    2026-06-01 (OOD recall capped at 25-47% even after retraining). The
+    production verdict now comes from the four-signal advisory ensemble
+    (v9c + ANDi + v8 + symmetry) — measured 97% recall / 6% FPR / 0.83
+    F1 at the balanced operating point on the 246-sample bench.
+
+    Kept as a stub so any external caller gets a clean 'removed' response
+    instead of a 500. The /predict HTTP endpoint also returns 410 Gone.
+    """
+    return {'removed': True, 'reason': (
+        'classifier ensemble removed 2026-06-01; verdict now from the '
+        '4-signal advisory (v9c+ANDi+v8+symmetry). See proposals/v9b_normative_jepa_conformal_anomaly.md '
+        'for the replacement path under development.'
+    )}
+
+
+class DashboardHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, directory=None, **kwargs):
+        super().__init__(*args, directory=str(WEB_DIR), **kwargs)
+
+    # ---- Per-request observability hooks --------------------------------
+    def setup(self):
+        super().setup()
+        # Request ID: trust the client's X-Request-ID if present (good for
+        # tracing through a CDN / proxy), else generate one.
+        self._request_id = self.headers.get('X-Request-ID') if hasattr(self, 'headers') else None
+        if not self._request_id:
+            self._request_id = uuid.uuid4().hex[:12]
+        self._req_start = time.perf_counter()
+
+    def _log_request(self, status: int, extra: str = ''):
+        elapsed_ms = (time.perf_counter() - self._req_start) * 1000
+        logger.info(
+            'req_id=%s method=%s path=%s status=%d duration_ms=%.1f %s',
+            getattr(self, '_request_id', '-'),
+            self.command, self.path, status, elapsed_ms, extra,
+        )
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == '/health':
+            self.respond_json({'status': 'ok',
+                                'uptime_seconds': round(time.time() - PROCESS_START_TS, 1),
+                                'version': SERVER_VERSION}); return
+        if parsed.path == '/version':
+            self.respond_json({'version': SERVER_VERSION,
+                                'python': sys.version.split()[0]}); return
+        if parsed.path == '/status':
+            self.respond_json(_get_status_snapshot()); return
+        if parsed.path == '/metrics':
+            self.respond_json(load_model_metrics())
+            return
+        return super().do_GET()
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == '/predict':
+            self.handle_predict()
+            return
+        if parsed.path == '/segment':
+            self.handle_segment()
+            return
+        if parsed.path == '/explain':
+            self.handle_explain()
+            return
+        self.send_error(404, 'Endpoint not found')
+
+    def handle_segment(self):
+        content_type = self.headers.get('Content-Type', '')
+        if 'multipart/form-data' not in content_type:
+            self.send_error(400, 'Expected multipart/form-data')
+            return
+
+        boundary_match = re.search(r'boundary=(.+)', content_type)
+        if not boundary_match:
+            self.send_error(400, 'Missing boundary in Content-Type header')
+            return
+
+        boundary = boundary_match.group(1)
+        if boundary.startswith('"') and boundary.endswith('"'):
+            boundary = boundary[1:-1]
+        boundary_bytes = boundary.encode('utf-8')
+
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length)
+        form = self.parse_multipart(body, boundary_bytes)
+
+        file_item = form.get('image')
+        if not file_item or 'content' not in file_item:
+            self.send_error(400, 'Missing image upload')
+            return
+
+        try:
+            threshold = float(form.get('threshold') or 0.5)
+        except (TypeError, ValueError):
+            threshold = 0.5
+        modality_raw = form.get('modality')
+        modality = str(modality_raw).strip().lower() if isinstance(modality_raw, str) else None
+        # Frontend may already have classifier consensus from a parallel
+        # /predict call; if so it sets enable_v3_fallback=1 to allow the
+        # cascade's v3 fallback (which is otherwise gated to prevent FPs on
+        # healthy brains). Accepts "1", "true", "yes".
+        v3_raw = form.get('enable_v3_fallback') or form.get('v3_fallback') or ''
+        enable_v3 = str(v3_raw).strip().lower() in ('1', 'true', 'yes')
+
+        try:
+            result = segment_image(file_item['content'], threshold=threshold,
+                                    modality=modality, enable_v3_fallback=enable_v3)
+            # Augment with the 4-signal advisory verdict so /segment
+            # callers see the ensemble decision directly (the main
+            # analyze flow in app.js hits /segment, not /explain). The
+            # advisory needs the raw RGB which segment_image already
+            # decoded; we re-decode here to keep segment_image pure.
+            v9b = None
+            _img_rgb = None
+            try:
+                from PIL import Image as _PIL
+                import io as _io
+                from src.research.v9b_advisory import compute_advisory
+                _img = _PIL.open(_io.BytesIO(file_item['content'])).convert('RGB')
+                _img_rgb = np.asarray(_img, dtype=np.uint8)
+                v8_area_px = int(result.get('tumor_area_px', 0) or 0)
+                v9b = compute_advisory(_img_rgb, v8_area_px=v8_area_px)
+                if v9b is not None:
+                    result['v9b_advisory'] = v9b
+                    result['verdict'] = v9b.get('verdict', 'no_tumor')
+                    result['confidence'] = v9b.get('confidence', 'low')
+                    result['rule'] = v9b.get('rule', 'ensemble')
+                    result['signals_used'] = v9b.get('signals_used', 'unknown')
+                    result['operating_point'] = v9b.get('operating_point', 'balanced')
+                    result['review_recommended'] = bool(v9b.get('review_recommended', False))
+            except Exception as exc:
+                result.setdefault('v9b_advisory', {'enabled': False,
+                                                    'reason': f'advisory wire-up failed: {exc}'})
+                # Fall back to v8-area gate for the top-level verdict
+                result.setdefault('verdict',
+                    'TUMOR' if int(result.get('tumor_area_px', 0) or 0) >= 50 else 'no_tumor')
+                result.setdefault('confidence', 'low' if result.get('confidence_tier') == 'requires_review' else 'high')
+                result.setdefault('rule', 'Tumor Outline Drawer found >= 50 pixels of tumor area')
+                result.setdefault('signals_used', '1 detector active: Tumor Outline Drawer')
+                result.setdefault('operating_point', 'fallback')
+                result.setdefault('review_recommended', False)
+
+            # --- Localization fallback ---------------------------------
+            # When v8 returned an empty mask but the ensemble verdict is
+            # TUMOR (the diagonal blindspot case), derive a binary mask
+            # from whichever neural anomaly signal fired, then run the
+            # same MedSAM refiner v8 would have triggered. End result:
+            # UI gets a full set of tabs (Coarse Mask/Overlay = amber
+            # anomaly-derived, Refined Mask/Overlay = MedSAM-refined,
+            # MedSAM Bbox = bbox prompt) just like a regular v8-positive
+            # response, instead of "TUMOR DETECTED but no mask".
+            result['mask_source'] = 'v8'
+            if (v9b is not None and _img_rgb is not None
+                    and result.get('verdict') == 'TUMOR'
+                    and int(result.get('tumor_area_px', 0) or 0) == 0):
+                try:
+                    from src.research.v9b_advisory import (
+                        compute_anomaly_localization_map, synthesize_fallback_mask)
+                    from PIL import Image as _PIL2
+                    import io as _io2
+                    # Pick the loudest firing signal as the map source
+                    prefer = 'andi' if v9b.get('andi_fired') else 'v9c'
+                    map_info = compute_anomaly_localization_map(_img_rgb, prefer=prefer)
+                    if map_info is not None:
+                        target_hw = (256, 256)
+                        fallback_mask = synthesize_fallback_mask(
+                            map_info['map'], target_hw=target_hw,
+                            percentile=97.0, min_area_px=30)
+                        if fallback_mask is not None:
+                            # Render the fallback mask + amber overlay as
+                            # data URLs in v8's format so the rest of the
+                            # pipeline (MedSAM, UI rendering) sees them
+                            # as if v8 itself had produced them.
+                            disp_img = _img.convert('RGB').resize(
+                                (target_hw[1], target_hw[0]), _PIL2.BILINEAR)
+                            disp_arr = np.asarray(disp_img, dtype=np.uint8)
+                            overlay = disp_arr.copy()
+                            alpha = (fallback_mask > 0)
+                            if alpha.any():
+                                # Amber tint distinguishes anomaly-derived
+                                # masks from v8's green ones in the UI
+                                overlay[alpha] = (
+                                    0.5 * np.array([245, 158, 11], dtype=np.uint8)
+                                    + 0.5 * overlay[alpha]
+                                ).astype(np.uint8)
+
+                            def _png_data_url(np_img):
+                                buf = _io2.BytesIO()
+                                _PIL2.fromarray(np_img).save(buf, format='PNG')
+                                return 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode('utf-8')
+
+                            # Replace v8's empty mask/overlay with the
+                            # fallback. _maybe_apply_medsam_refiner reads
+                            # result['mask'] as its coarse input, so this
+                            # gives MedSAM a non-empty bbox to refine.
+                            result['mask'] = _png_data_url(fallback_mask * 255)
+                            result['overlay'] = _png_data_url(overlay)
+                            result['tumor_area_px'] = int(fallback_mask.sum())
+                            result['mask_source'] = 'anomaly_fallback'
+                            result['mask_fallback_signal'] = map_info['source']
+                            result['mask_fallback_inference_ms'] = map_info.get('inference_ms', 0)
+                            if map_info['source'] == 'andi':
+                                result['mean_prob_in_mask'] = float(v9b.get('andi_max', 0))
+                            else:
+                                result['mean_prob_in_mask'] = float(v9b.get('v9c_p95', 0))
+
+                            # Re-invoke the MedSAM refiner on the fallback
+                            # mask. The refiner moves the current
+                            # mask/overlay to coarse_mask/coarse_overlay
+                            # and replaces mask/overlay with the refined
+                            # output, plus populates medsam_refiner.bbox_overlay
+                            # for the MedSAM Bbox tab. So after this call
+                            # the UI tabs are all populated:
+                            #   Coarse Mask/Overlay     = our amber fallback
+                            #   Refined Mask/Overlay    = MedSAM result
+                            #   MedSAM Bbox             = bbox prompt overlay
+                            try:
+                                _maybe_apply_medsam_refiner(result, file_item['content'])
+                            except Exception:
+                                # MedSAM is non-essential — if it fails,
+                                # leave the amber fallback as both coarse
+                                # AND refined so the UI still has visuals.
+                                result['coarse_mask'] = result['mask']
+                                result['coarse_overlay'] = result['overlay']
+                                result.setdefault('medsam_refiner', {
+                                    'enabled': True, 'available': False,
+                                    'reason': 'medsam_failed_on_fallback',
+                                })
+                except Exception as exc:
+                    result['mask_fallback_error'] = f'{type(exc).__name__}: {exc}'
+
+            # --- Model insight maps (layperson-friendly heatmaps) ----
+            # Renders per-signal anomaly heatmaps + an "AI Agreement"
+            # composite, attached as result['model_insights']. Used to
+            # fill the previously-empty right pane of the visualization
+            # panel with explanatory overlays. Cost: ~0 — the maps are
+            # already computed inside the advisory call; we just keep
+            # them and render to PNG instead of dropping after collapse
+            # to scalars.
+            if _img_rgb is not None and v9b is not None:
+                try:
+                    from src.research.v9b_advisory import (
+                        compute_model_insight_maps, render_heatmap_overlay,
+                        render_agreement_overlay)
+                    from PIL import Image as _PIL3
+                    import io as _io3
+                    insights = compute_model_insight_maps(_img_rgb)
+
+                    def _png_data_url2(rgb_arr):
+                        buf = _io3.BytesIO()
+                        _PIL3.fromarray(rgb_arr).save(buf, format='PNG')
+                        return 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode('utf-8')
+
+                    insight_payload = {
+                        'available_signals': sorted(insights.keys()),
+                        'maps': {},
+                    }
+                    fired_for_agreement = []
+                    for sig in ('v9c', 'andi', 'symmetry'):
+                        info = insights.get(sig)
+                        if info is None:
+                            insight_payload['maps'][sig] = None
+                            continue
+                        heat = render_heatmap_overlay(
+                            _img_rgb, info['map'], alpha=0.55,
+                            target_hw=(256, 256), mask_below_pct=50.0)
+                        insight_payload['maps'][sig] = {
+                            'overlay': _png_data_url2(heat),
+                            'fired_pct': round(100 * float(info['fired'].mean()), 2),
+                        }
+                        fired_for_agreement.append(info['fired'])
+                    # AI Agreement composite — pixels flagged by 2+ detectors
+                    agree_overlay = render_agreement_overlay(
+                        _img_rgb, fired_for_agreement, target_hw=(256, 256))
+                    insight_payload['agreement_overlay'] = _png_data_url2(agree_overlay)
+                    insight_payload['n_signals'] = len(fired_for_agreement)
+                    result['model_insights'] = insight_payload
+                except Exception as exc:
+                    result['model_insights'] = {'available': False,
+                                                 'reason': f'{type(exc).__name__}: {exc}'}
+
+            self.respond_json(result)
+        except Exception as exc:
+            self.respond_json({'success': False, 'error': str(exc)}, status=500)
+
+    def handle_predict(self):
+        """REMOVED 2026-06-01. The classifier ensemble (cnn/transfer/vit) was
+        deprecated; production verdict comes from v8 segmentation via
+        /explain only. Returns 410 Gone so older UI clients can fall back."""
+        self.respond_json({
+            'success': False,
+            'removed': True,
+            'message': (
+                '/predict has been removed. Classifier ensemble was '
+                'deprecated 2026-06-01 (OOD recall capped at 25-47%). '
+                'Use /explain or /segment instead — both return the '
+                '4-signal advisory verdict (v9c+ANDi+v8+symmetry, '
+                'measured 97% recall / 6% FPR at the balanced operating '
+                'point).'
+            ),
+        }, status=410)
+
+    def handle_explain(self):
+        content_type = self.headers.get('Content-Type', '')
+        if 'multipart/form-data' not in content_type:
+            self.send_error(400, 'Expected multipart/form-data')
+            return
+
+        boundary_match = re.search(r'boundary=(.+)', content_type)
+        if not boundary_match:
+            self.send_error(400, 'Missing boundary in Content-Type header')
+            return
+
+        boundary = boundary_match.group(1)
+        if boundary.startswith('"') and boundary.endswith('"'):
+            boundary = boundary[1:-1]
+        boundary_bytes = boundary.encode('utf-8')
+
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length)
+        form = self.parse_multipart(body, boundary_bytes)
+
+        file_item = form.get('image')
+        if not file_item or 'content' not in file_item:
+            self.send_error(400, 'Missing image upload')
+            return
+
+        try:
+            threshold = float(form.get('threshold') or 0.5)
+        except (TypeError, ValueError):
+            threshold = 0.5
+
+        modality_raw = form.get('modality')
+        modality = str(modality_raw).strip().lower() if isinstance(modality_raw, str) and modality_raw else None
+        backend_raw = form.get('backend')
+        backend = str(backend_raw).strip().lower() if isinstance(backend_raw, str) and backend_raw else None
+        if backend in ('', 'auto'):
+            backend = None
+
+        # modality_channels: optional channel triplet hint for multimodal stacks.
+        # The web UI doesn't expose this yet; an API caller can pass
+        # modality_channels="t1c,t2,flair" (comma-separated, 3 names).
+        modality_channels = None
+        mc_raw = form.get('modality_channels')
+        if isinstance(mc_raw, str) and mc_raw:
+            parts = [p.strip() for p in mc_raw.split(',') if p.strip()]
+            if len(parts) == 3:
+                modality_channels = tuple(parts)
+
+        try:
+            result = build_explanation(
+                file_item['content'],
+                threshold=threshold,
+                modality=modality,
+                backend=backend,
+                modality_channels=modality_channels,
+            )
+            self.respond_json(result)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            self.respond_json({'success': False, 'error': str(exc)}, status=500)
+
+    def parse_multipart(self, body, boundary):
+        parts = body.split(b'--' + boundary)
+        data = {}
+        for part in parts:
+            if not part or part in (b'--', b'--\r\n'):
+                continue
+            part = part.strip(b'\r\n')
+            if not part:
+                continue
+
+            header_bytes, _, content = part.partition(b'\r\n\r\n')
+            headers = {}
+            for line in header_bytes.split(b'\r\n'):
+                name, _, value = line.decode('utf-8', 'ignore').partition(':')
+                headers[name.lower().strip()] = value.strip()
+
+            disposition = headers.get('content-disposition', '')
+            disposition_data = self.parse_content_disposition(disposition)
+            name = disposition_data.get('name')
+            if not name:
+                continue
+
+            if 'filename' in disposition_data:
+                data[name] = {
+                    'filename': disposition_data.get('filename'),
+                    'content': content.rstrip(b'\r\n'),
+                }
+            else:
+                data[name] = content.decode('utf-8', errors='replace').strip()
+        return data
+
+    def parse_content_disposition(self, disposition):
+        values = {}
+        parts = [part.strip() for part in disposition.split(';') if part.strip()]
+        for part in parts:
+            if '=' in part:
+                key, val = part.split('=', 1)
+                values[key.strip().lower()] = val.strip('"')
+        return values
+
+    def respond_json(self, data, status=200):
+        payload = json.dumps(data).encode('utf-8')
+        # gzip for non-trivial payloads when the client supports it. Saves
+        # 60-80% on bandwidth for /explain (which carries base64-PNG dumps).
+        accept_enc = self.headers.get('Accept-Encoding', '')
+        gzipped = False
+        if len(payload) > 1024 and 'gzip' in accept_enc.lower():
+            payload = gzip.compress(payload)
+            gzipped = True
+
+        elapsed_ms = (time.perf_counter() - self._req_start) * 1000
+
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        if gzipped:
+            self.send_header('Content-Encoding', 'gzip')
+        self.send_header('Content-Length', str(len(payload)))
+        self.send_header('X-Request-ID', self._request_id)
+        self.send_header('X-Server-Version', SERVER_VERSION)
+        self.send_header('X-Inference-Time-ms', f'{elapsed_ms:.1f}')
+        # CORS - allow the dashboard hosted on Spaces to talk to itself across
+        # any prefix the platform proxies through.
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(payload)
+        self._log_request(status, extra=f'gzipped={gzipped} size_kb={len(payload)/1024:.1f}')
+
+    def log_message(self, format, *args):
+        # Suppress the default per-line stderr from BaseHTTPRequestHandler;
+        # we emit our own structured logs in respond_json / handlers.
+        return
+
+    def handle_one_request(self):
+        # Swallow client-disconnect noise. BrokenPipeError /
+        # ConnectionResetError happen when the browser cancels the request
+        # (refresh, navigate-away) before we finish writing the response.
+        # The default stdlib handler logs a 20-line traceback for each one,
+        # which is alarming-looking but harmless. We log a single info line
+        # instead.
+        try:
+            return super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            logger.info('client_disconnected req_id=%s err=%s',
+                         getattr(self, '_request_id', '-'),
+                         type(exc).__name__)
+
+
+def _get_status_snapshot() -> dict:
+    """Real /status endpoint: what models are actually loaded, real GPU memory,
+    classifier weight presence. Replaces the previous mock UI 'System Status'
+    block (which showed hard-coded '3/3 models, 4.2/8 GB GPU, 2 pending').
+    """
+    snap: dict = {
+        'version': SERVER_VERSION,
+        'uptime_seconds': round(time.time() - PROCESS_START_TS, 1),
+        'classifiers': {},
+        'segmentation_models': [],
+        'onnx_runtime': {'available': False, 'providers': [], 'sessions_loaded': 0},
+        'gpu': {'available': False},
+        'llm': {
+            'ollama_text_model': os.environ.get('OLLAMA_MODEL_TEXT', 'qwen2.5:1.5b'),
+            'ollama_vision_model': os.environ.get('OLLAMA_MODEL_VISION', 'qwen2.5vl:3b'),
+            'hf_inference_token_present': bool(os.environ.get('HF_TOKEN')),
+            'anthropic_token_present': bool(os.environ.get('ANTHROPIC_API_KEY')),
+        },
+    }
+    # Classifier ensemble was removed 2026-06-01 (see top-of-file note).
+    # The 'classifiers' key is intentionally left as an empty dict so the
+    # /status JSON schema stays stable for any external consumer.
+    snap['classifiers_removed'] = True
+    snap['classifiers_removed_reason'] = (
+        'Deprecated 2026-06-01: ensemble OOD recall capped at 25-47%. '
+        'Verdict now from the 4-signal advisory (v9c + ANDi + v8 + '
+        'symmetry) — 97% recall / 6% FPR at the balanced operating point.'
+    )
+    snap['verdict_source'] = '4-detector ensemble'
+    snap['advisory_signals'] = ['Pattern Detector', 'Reconstruction Detector',
+                                  'Tumor Outline Drawer', 'Asymmetry Detector']
+    snap['advisory_operating_points'] = {
+        'balanced (default)': '97% recall / 6% FPR / 0.83 F1',
+        'high_recall': '100% recall / 14% FPR / 0.71 F1',
+        'high_specificity': '92% recall / 4% FPR / 0.85 F1',
+    }
+    # Segmentation model directories. A model counts as 'present' if EITHER
+    # the .pt or .onnx file exists - both are valid inference paths and the
+    # Spaces container only has .onnx (downloaded from HF Hub at boot).
+    for d in SEGMENTATION_DIRS + list(MODALITY_DIRS.values()):
+        pt = d / 'best_model.pt'
+        onnx = d / 'best_model.onnx'
+        if not pt.exists() and not onnx.exists():
+            continue
+        snap['segmentation_models'].append({
+            'dir': d.name,
+            'pt_size_mb': round(pt.stat().st_size / 1e6, 1) if pt.exists() else None,
+            'onnx_size_mb': round(onnx.stat().st_size / 1e6, 1) if onnx.exists() else None,
+            'onnx': onnx.name if onnx.exists() else None,
+            'preferred_runtime': 'onnx' if (onnx.exists() and USE_ONNX) else 'pytorch',
+        })
+    # ONNX runtime telemetry.
+    try:
+        import onnxruntime as ort
+        snap['onnx_runtime'] = {
+            'available': True,
+            'version': ort.__version__,
+            'providers': ort.get_available_providers(),
+            'sessions_loaded': len(ONNX_CACHE),
+        }
+    except ImportError:
+        pass
+    # GPU memory (PyTorch path).
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info()
+            snap['gpu'] = {
+                'available': True,
+                'name': torch.cuda.get_device_name(0),
+                'memory_used_mb': round((total - free) / 1e6, 1),
+                'memory_total_mb': round(total / 1e6, 1),
+                'memory_free_mb': round(free / 1e6, 1),
+            }
+    except Exception:
+        pass
+    return snap
+
+
+def _ensure_onnx_models_downloaded():
+    """If the ONNX model files aren't bundled with the container (the case on
+    HuggingFace Spaces, where the 1 GB Space repo budget is too small for
+    ~440 MB of model weights), pull them from a separate HF Model repo at
+    startup. Model repos have much larger free quotas and are the canonical
+    HF pattern for distributing trained weights.
+
+    Override `HF_MODELS_REPO` env var to point at your own Model repo.
+    Files are downloaded once and cached on disk; subsequent boots reuse
+    the cache instantly.
+    """
+    repo = os.environ.get('HF_MODELS_REPO', 'Tubai01/neurolens-models')
+    # ONNX weights are required for fast forward inference. Classifier .pt
+    # weights are OPTIONAL - they enable real Grad-CAM via PyTorch autograd
+    # on Spaces (instead of the occlusion-sensitivity fallback). Pulled only
+    # if SPACES_DOWNLOAD_PT=1 is set, since torch is a ~250 MB install that
+    # we keep out of the default Spaces image.
+    needed = [
+        # (local target relative to ROOT_DIR, repo-relative path)
+        # v8 is the production model. dynamo-exported = graph + sidecar
+        # weights file; both must be present in the same directory or ORT
+        # fails with "external data not found".
+        ('segmentation_artifacts/attention_unet_v8/best_micro.onnx',
+         'attention_unet_v8/best_micro.onnx'),
+        ('segmentation_artifacts/attention_unet_v8/best_micro.onnx.data',
+         'attention_unet_v8/best_micro.onnx.data'),
+        ('segmentation_artifacts/attention_unet_v5/best_model.onnx',
+         'attention_unet_v5/best_model.onnx'),
+        ('segmentation_artifacts/attention_unet_v3/best_model.onnx',
+         'attention_unet_v3/best_model.onnx'),
+        ('segmentation_artifacts/attention_unet_t1c/best_model.onnx',
+         'attention_unet_t1c/best_model.onnx'),
+        # Classifier ONNXes (cnn / transfer / vit) deliberately NOT
+        # downloaded — see 2026-06-01 deprecation note at the top of
+        # this file. Saves ~250 MB at first-boot and avoids loading
+        # weights that nothing in the pipeline will ever call.
+    ]
+    # Conformal-counterfactual calibration JSONs. Each is ~1 KB and unlocks
+    # the research-grade conformal panel in the dashboard. The set of files
+    # is known statically here so the Space doesn't need to list the repo.
+    for slug in (
+        'identity', 'modality_keep_T1', 'modality_keep_T1c',
+        'modality_keep_FLAIR', 'intensity_shift_+0.10',
+        'intensity_shift_-0.10', 'contrast_scale_0.70',
+        'contrast_scale_1.50',
+    ):
+        needed.append(
+            (f'conformal_artifacts/{slug}.json',
+             f'conformal_artifacts/{slug}.json')
+        )
+    # v9c JEPA-on-DINOv2 predictor weights (136 MB) — opt-in, only fetched
+    # when V9C_DOWNLOAD=1 because the file is large and the v9c path is
+    # itself opt-in via V9C_ENABLE=1. On CPU-basic Spaces the v9c inference
+    # is too slow to run anyway (~6s/req); cpu-upgrade or GPU-backed Spaces
+    # should set both V9C_DOWNLOAD=1 and V9C_ENABLE=1 to activate the
+    # high-recall ensemble.
+    if os.environ.get('V9C_DOWNLOAD', '0').strip().lower() in ('1', 'true', 'yes'):
+        needed.append(('v9b_artifacts/v9c_stage1/last.pt',
+                        'v9c_stage1/last.pt'))
+    # ANDi unconditional DDPM weights (16 MB) — opt-in via V9B_ANDI_DOWNLOAD=1.
+    # Pairs with V9B_ANDI_ENABLE=1 to activate the 4-signal ensemble
+    # (v9c + v8 + sym + andi) that hits 100% recall at 14% FPR. ANDi
+    # inference is much cheaper than v9c (~190ms GPU / ~2-3s CPU) since
+    # the DDPM is small (16 MB vs 340 MB DINOv2-base).
+    if os.environ.get('V9B_ANDI_DOWNLOAD', '0').strip().lower() in ('1', 'true', 'yes'):
+        needed.append(('v9b_artifacts/v9b_andi_ddpm/last.pt',
+                        'v9b_andi_ddpm/last.pt'))
+    missing = [(loc, rep) for loc, rep in needed if not (ROOT_DIR / loc).exists()]
+    if not missing:
+        logger.info('all_onnx_models_already_present')
+        return
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        logger.warning('huggingface_hub_not_installed missing_models=%d', len(missing))
+        return
+    import shutil as _shutil
+    token = os.environ.get('HF_TOKEN') or None  # public Model repos work tokenless too
+    for local_rel, repo_rel in missing:
+        local = ROOT_DIR / local_rel
+        try:
+            t0 = time.perf_counter()
+            downloaded = hf_hub_download(
+                repo_id=repo, filename=repo_rel,
+                repo_type='model', token=token,
+            )
+            local.parent.mkdir(parents=True, exist_ok=True)
+            _shutil.copy2(downloaded, local)
+            ms = (time.perf_counter() - t0) * 1000
+            logger.info('downloaded_model file=%s repo=%s elapsed_ms=%.0f',
+                         local_rel, repo, ms)
+        except Exception as exc:
+            logger.warning('download_failed file=%s err=%s', local_rel, exc)
+
+
+def _warm_models_async():
+    """Pre-load ONNX sessions for the segmentation cascade in a background
+    thread so the first /segment request doesn't pay the cold-start tax.
+
+    Classifier warmup was removed 2026-06-01 along with the classifier
+    ensemble (see top-of-file deprecation note).
+
+    Failure is silent: if a model file isn't there or onnxruntime can't open
+    it, we just log and move on - the request path will surface a real error
+    if needed.
+    """
+    def _warm():
+        t0 = time.perf_counter()
+        warmed = 0
+        # Segmentation cascade pair. Accept either .pt (dev box) or .onnx
+        # alone (Spaces, where we only have .onnx after the HF Hub download).
+        # v5 first (trained with negatives), v3 as fallback, T1c specialist.
+        for d in [ROOT_DIR / 'segmentation_artifacts' / 'attention_unet_v5',
+                   ROOT_DIR / 'segmentation_artifacts' / 'attention_unet_v3',
+                   MODALITY_DIRS.get('t1c')]:
+            if d is None:
+                continue
+            onnx = d / 'best_model.onnx'
+            pt = d / 'best_model.pt'
+            if not onnx.exists() and not pt.exists():
+                continue
+            # Prefer .onnx if it exists; fall back to the sibling resolver
+            # on the .pt path otherwise.
+            target = onnx if onnx.exists() else _segmentation_onnx_path(pt)
+            if target and USE_ONNX:
+                if _get_onnx_session(target) is not None:
+                    warmed += 1
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.info('model_warmup_complete sessions=%d duration_ms=%.1f', warmed, elapsed_ms)
+
+    threading.Thread(target=_warm, name='trinetra-warmup', daemon=True).start()
+
+
+def run(port=8501, host: str = ''):
+    if not WEB_DIR.exists():
+        raise FileNotFoundError(f'Web dashboard files not found: {WEB_DIR}')
+
+    address = (host, port)
+    # ThreadingHTTPServer: parallel requests don't queue behind each other.
+    # Important when a slow /explain LLM call would otherwise block /predict
+    # or /health probes from the Spaces orchestrator.
+    server = ThreadingHTTPServer(address, DashboardHandler)
+    url = f'http://localhost:{port}/' if not host else f'http://{host}:{port}/'
+    logger.info('trinetra_dashboard_starting version=%s url=%s', SERVER_VERSION, url)
+    # Pull ONNX weights from HF Hub if they aren't bundled (Spaces deploy
+    # path). Synchronous so the first request never races a half-downloaded
+    # model; ~30 s on first boot, instant on subsequent boots (cached).
+    _ensure_onnx_models_downloaded()
+    _warm_models_async()
+    print(f'NeuroLens AI dashboard running at {url}')
+    print(f'Version: {SERVER_VERSION}.  Endpoints: /predict /segment /explain '
+          '/metrics /status /health /version.')
+    print('Press Ctrl+C here to stop the server.')
+    server.serve_forever()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Run the NeuroLens AI HTML dashboard')
+    # Defaults are env-driven so the Spaces Dockerfile can override without
+    # touching the CLI. HF Spaces sets PORT=7860 on Docker SDK and expects
+    # the container to bind 0.0.0.0; local dev uses 8501 on localhost.
+    parser.add_argument('--port', type=int,
+                         default=int(os.environ.get('PORT', '8501')))
+    parser.add_argument('--host', type=str,
+                         default=os.environ.get('HOST', ''))
+    args = parser.parse_args()
+    run(args.port, host=args.host)
