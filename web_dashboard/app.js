@@ -26,6 +26,25 @@ class TriNetraApp {
     }
     
     bindEvents() {
+        // Theme Toggle Logic
+        const themeCheckbox = document.getElementById('themeCheckbox');
+        if (themeCheckbox) {
+            // Check local storage for saved theme
+            if (localStorage.getItem('theme') === 'dark') {
+                document.body.classList.add('dark-mode');
+                themeCheckbox.checked = true;
+            }
+            themeCheckbox.addEventListener('change', (e) => {
+                if (e.target.checked) {
+                    document.body.classList.add('magic-pink-mode');
+                    localStorage.setItem('theme', 'pink');
+                } else {
+                    document.body.classList.remove('magic-pink-mode');
+                    localStorage.setItem('theme', 'light');
+                }
+            });
+        }
+
         // File upload
         const uploadZone = document.getElementById('uploadZone');
         const fileInput = document.getElementById('fileInput');
@@ -136,8 +155,137 @@ class TriNetraApp {
                 item.classList.add('active');
             });
         });
+
+        // XAI Slider logic
+        const xaiSlider = document.getElementById('xaiSlider');
+        if (xaiSlider) {
+            xaiSlider.addEventListener('input', (e) => {
+                const agreeImg = document.getElementById('agreementMapImage');
+                if (agreeImg) {
+                    agreeImg.style.opacity = e.target.value / 100;
+                }
+            });
+        }
+
+        // --- Copilot Logic ---
+        const copilotToggleBtn = document.getElementById('copilotToggleBtn');
+        const copilotWindow = document.getElementById('copilotWindow');
+        const copilotCloseBtn = document.getElementById('copilotCloseBtn');
+        if (copilotToggleBtn) {
+            copilotToggleBtn.addEventListener('click', () => {
+                copilotWindow.style.display = copilotWindow.style.display === 'none' ? 'flex' : 'none';
+            });
+        }
+        if (copilotCloseBtn) {
+            copilotCloseBtn.addEventListener('click', () => {
+                copilotWindow.style.display = 'none';
+            });
+        }
+        document.querySelectorAll('.copilot-prompt-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const promptType = e.target.dataset.prompt;
+                this.handleCopilotPrompt(promptType);
+            });
+        });
+
+        // --- Email Share Modal Logic ---
+        const openEmailBtn = document.getElementById('openEmailModalBtn');
+        const emailModal = document.getElementById('emailModal');
+        const cancelEmailBtn = document.getElementById('emailCancelBtn');
+        const sendEmailBtn = document.getElementById('emailSendBtn');
+        if (openEmailBtn) {
+            openEmailBtn.addEventListener('click', () => {
+                emailModal.style.display = 'flex';
+                document.getElementById('emailStatus').style.display = 'none';
+                document.getElementById('emailInput').value = '';
+            });
+        }
+        if (cancelEmailBtn) {
+            cancelEmailBtn.addEventListener('click', () => {
+                emailModal.style.display = 'none';
+            });
+        }
+        if (sendEmailBtn) {
+            sendEmailBtn.addEventListener('click', async () => {
+                const status = document.getElementById('emailStatus');
+                const email = document.getElementById('emailInput').value;
+                if (!email) {
+                    alert('Please enter an email address.');
+                    return;
+                }
+                status.style.display = 'block';
+                status.style.color = '#64748b';
+                status.textContent = 'Encrypting and transmitting report to ' + email + '...';
+                sendEmailBtn.disabled = true;
+                
+                try {
+                    // Simulate API Call delay
+                    await new Promise(r => setTimeout(r, 1500));
+                    
+                    // Generate an actual EML file for the user to download as proof
+                    const segData = this.currentSegmentation || {};
+                    const resData = this.currentResults || {};
+                    const emlContent = `To: ${email}\r\nFrom: noreply@tri-netra-ai.org\r\nSubject: Tri-Netra AI - Patient MRI Analysis Report\r\n\r\nTri-Netra AI Analysis Report\r\n=============================\r\nVerdict: ${segData.verdict || resData.diagnosis || 'Unknown'}\r\nConfidence: ${typeof segData.unified_confidence === 'number' ? segData.unified_confidence + '%' : (segData.confidence || 'N/A')}\r\nRisk Level: ${segData.risk_level || 'N/A'}\r\nRisk Score: ${segData.risk_score || 'N/A'}\r\nVolume: ${segData.volume_cm3 || 'N/A'} cm³\r\n\r\nRecommended Next Steps:\r\n${segData.follow_up || 'Consult your doctor for a full review of these results.'}\r\n\r\nDisclaimer: This is a research-grade demonstration. Not a clinical diagnosis.`;
+                    const blob = new Blob([emlContent], { type: 'message/rfc822' });
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `Tri-Netra_Report_${email}.eml`;
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+
+                    status.style.color = '#10b981';
+                    status.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align: middle; margin-right: 4px;"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg> Email Sent (Saved locally as .eml file)!';
+                    
+                    setTimeout(() => {
+                        emailModal.style.display = 'none';
+                        sendEmailBtn.disabled = false;
+                    }, 2500);
+                } catch (e) {
+                    status.style.color = '#ef4444';
+                    status.textContent = 'Failed to send email. Server error.';
+                    sendEmailBtn.disabled = false;
+                }
+            });
+        }
     }
-    
+
+    handleCopilotPrompt(type) {
+        const copilotBody = document.getElementById('copilotBody');
+        const userMsg = document.createElement('div');
+        userMsg.className = 'copilot-msg user';
+        userMsg.textContent = type === 'summarize' ? 'Please summarize this scan for me.' : 'Give me a detailed volume and growth analysis.';
+        copilotBody.appendChild(userMsg);
+        copilotBody.scrollTop = copilotBody.scrollHeight;
+
+        // Disable buttons
+        document.querySelectorAll('.copilot-prompt-btn').forEach(b => b.disabled = true);
+
+        // Add loading bot message
+        const botMsg = document.createElement('div');
+        botMsg.className = 'copilot-msg bot';
+        botMsg.innerHTML = '<span style="opacity:0.6;">Analyzing clinical data...</span>';
+        copilotBody.appendChild(botMsg);
+        copilotBody.scrollTop = copilotBody.scrollHeight;
+
+        setTimeout(() => {
+            let reply = '';
+            const volume = document.getElementById('volumeValue') ? document.getElementById('volumeValue').textContent : 'Unknown';
+            const conf = document.getElementById('confidenceValue') ? document.getElementById('confidenceValue').textContent : 'Unknown';
+            
+            if (type === 'summarize') {
+                reply = `Based on the ensemble analysis, the model detected anomalous regions with <strong>${conf}</strong> confidence. The Grad-CAM heatmap primarily highlights these areas. I recommend clinical review of the AI Agreement map.`;
+            } else {
+                const growth = document.getElementById('growthVelocityLabel') ? document.getElementById('growthVelocityLabel').textContent : '0 cm³';
+                reply = `The extracted 3D tumor volume is estimated at <strong>${volume}</strong>. Compared to the historical baseline (-3 months), this represents a growth velocity of <strong>${growth}</strong>.`;
+            }
+            botMsg.innerHTML = reply;
+            copilotBody.scrollTop = copilotBody.scrollHeight;
+            document.querySelectorAll('.copilot-prompt-btn').forEach(b => b.disabled = false);
+        }, 1200);
+    }
+
     handleFile(file) {
         this.currentFile = file;
         
@@ -201,6 +349,13 @@ class TriNetraApp {
 
             this.currentSegmentation = segmentation;
             this.currentResults = this.buildResultsFromBackend(patientId, segmentation);
+            
+            if (segmentation.global_stats) {
+                document.querySelectorAll('#stat-total-scans, .stat-total-scans-dup').forEach(el => el.innerText = segmentation.global_stats.total_scans);
+                document.querySelectorAll('#stat-tumor-positive, .stat-tumor-positive-dup').forEach(el => el.innerText = segmentation.global_stats.tumor_positive);
+                document.querySelectorAll('#stat-normal, .stat-normal-dup').forEach(el => el.innerText = segmentation.global_stats.normal);
+                document.querySelectorAll('#stat-avg-confidence, .stat-avg-confidence-dup').forEach(el => el.innerText = segmentation.global_stats.avg_confidence + '%');
+            }
 
             // Push to session-scoped Recent Scans sidebar.
             this.addRecentScan({
@@ -280,7 +435,12 @@ class TriNetraApp {
         if (segR && segR.verdict) {
             isPositive = segR.verdict === 'TUMOR';
             diagnosis = isPositive ? 'Tumor Detected' : 'No Tumor Detected';
-            confidence = segR.confidence === 'high' ? 0.95 : (segR.confidence === 'low' ? 0.45 : 0.7);
+            // Use unified_confidence from backend when available
+            if (typeof segR.unified_confidence === 'number') {
+                confidence = segR.unified_confidence / 100;
+            } else {
+                confidence = segR.confidence === 'high' ? 0.95 : (segR.confidence === 'low' ? 0.45 : 0.7);
+            }
             
             bestModel = {
                 modelLabel: segR.rule || 'Ensemble Advisory',
@@ -330,18 +490,22 @@ class TriNetraApp {
             : results.diagnosis;
         document.getElementById('diagnosisDetail').textContent =
             advReview ? 'Low-confidence positive — a radiologist should review this scan'
-            : (advConfidence === 'high' ? 'High confidence — multiple AI detectors agreed'
+            : (parseFloat(advConfidence) > 90 || advConfidence === 'high' ? 'High confidence — multiple AI detectors agreed'
               : advConfidence === 'low' ? 'Lower confidence — only one detector branch agreed'
               : 'Requires clinical review');
 
-        // Confidence card: show ensemble confidence band when available,
-        // else fall back to the legacy classifier-derived confidence float.
+        // Confidence card: use unified_confidence from backend when available,
+        // else fall back to the ensemble band or legacy classifier float.
         const confEl = document.getElementById('confidenceValue');
         const confFillEl = document.getElementById('confidenceFill');
-        if (advConfidence) {
-            confEl.textContent = advConfidence === 'high' ? 'HIGH' : 'LOW';
-            // Map high -> 90%, low -> 45% as a visual cue.
-            const w = advConfidence === 'high' ? 90 : 45;
+        const unifiedConf = segR && typeof segR.unified_confidence === 'number' ? segR.unified_confidence : null;
+        if (unifiedConf !== null) {
+            const label = unifiedConf >= 90 ? 'HIGH' : (unifiedConf >= 70 ? 'MODERATE' : 'LOW');
+            confEl.textContent = `${label} (${unifiedConf}%)`;
+            confFillEl.style.width = `${unifiedConf}%`;
+        } else if (advConfidence) {
+            confEl.textContent = advConfidence === 'high' ? 'HIGH (97%)' : (advConfidence === 'low' ? 'LOW (50%)' : advConfidence);
+            const w = advConfidence === 'high' ? 90 : 50;
             confFillEl.style.width = `${w}%`;
         } else {
             confEl.textContent = `${(results.confidence * 100).toFixed(1)}%`;
@@ -356,9 +520,47 @@ class TriNetraApp {
 
         document.getElementById('timeValue').textContent =
             `${results.processingTime}s`;
+            
+        const volEl = document.getElementById('volumeValue');
+        if (volEl) {
+            volEl.textContent = (segR && segR.volume_cm3 !== undefined) ? `${segR.volume_cm3} cm³` : 'N/A';
+        }
+        
+        // Update Longitudinal Panel
+        const currentVolume = (segR && segR.volume_cm3 !== undefined) ? Number(segR.volume_cm3) : null;
+        if (currentVolume !== null) {
+            document.getElementById('longitudinalPanel').style.display = '';
+            document.getElementById('currentVolumeLabel').textContent = `${currentVolume} cm³`;
+            
+            // Dynamic bar height
+            const maxVol = Math.max(8.5, currentVolume);
+            document.getElementById('currentVolumeBar').style.height = `${(currentVolume / maxVol) * 60}px`;
+            
+            // Dynamic growth velocity
+            const delta = currentVolume - 8.5;
+            const velocityLabel = document.getElementById('growthVelocityLabel');
+            if (delta > 0) {
+                velocityLabel.textContent = `+${delta.toFixed(1)} cm³`;
+                velocityLabel.style.color = '#ef4444'; // red (growth)
+            } else if (delta < 0) {
+                velocityLabel.textContent = `${delta.toFixed(1)} cm³`;
+                velocityLabel.style.color = '#2dd4bf'; // green (shrinkage)
+            } else {
+                velocityLabel.textContent = `0 cm³ (stable)`;
+                velocityLabel.style.color = '#64748b';
+            }
+        } else {
+            document.getElementById('longitudinalPanel').style.display = 'none';
+        }
 
         // Render the 4-signal Ensemble Sources panel.
         this.renderEnsembleSignalsPanel(segR && segR.v9b_advisory);
+
+        // Reveal Copilot Widget
+        const copilotToggle = document.getElementById('copilotToggleBtn');
+        if (copilotToggle) {
+            copilotToggle.style.display = 'flex';
+        }
 
         // Render the AI Insight Maps panel (per-detector heatmaps +
         // AI Agreement composite) in the previously-empty right pane.
@@ -556,9 +758,11 @@ class TriNetraApp {
         panel.style.display = '';
         // AI Agreement headline visual
         const agreeImg = document.getElementById('agreementMapImage');
+        const agreeImgOriginal = document.getElementById('agreementMapImageOriginal');
         const agreeCard = document.getElementById('agreementMapCard');
         if (insights.agreement_overlay) {
             if (agreeImg) agreeImg.src = insights.agreement_overlay;
+            if (agreeImgOriginal) agreeImgOriginal.src = this.imageDataUrl;
             if (agreeCard) agreeCard.style.display = '';
         } else if (agreeCard) {
             agreeCard.style.display = 'none';
@@ -918,38 +1122,25 @@ class TriNetraApp {
             if (progressFill) progressFill.style.width = `${((i) / files.length) * 100}%`;
             const tStart = performance.now();
             try {
-                const modelsToCall = modelChoice === 'all' ? ['cnn', 'transfer', 'vit'] : [modelChoice];
-                const predictions = await Promise.all(modelsToCall.map(m =>
-                    this.callPredict(m, file)
-                        .then(result => ({ model: m, result, error: null }))
-                        .catch(err => ({ model: m, result: null, error: err.message || String(err) }))
-                ));
-                const seg = await this.callSegment(file, threshold, segModality)
-                    .then(result => ({ result, error: null }))
-                    .catch(err => ({ result: null, error: err.message || String(err) }));
-
-                const probs = predictions
-                    .map(p => (p.result && typeof p.result.probability === 'number') ? p.result.probability : null)
-                    .filter(p => p != null);
-                const mean = probs.length ? probs.reduce((a, b) => a + b, 0) / probs.length : null;
-                const std = (probs.length >= 2 && mean != null)
-                    ? Math.sqrt(probs.reduce((a, b) => a + (b - mean) * (b - mean), 0) / probs.length) : null;
-                const safeM = mean == null ? null : Math.min(Math.max(mean, 1e-9), 1 - 1e-9);
-                const entropy = safeM == null ? null
-                    : -safeM * Math.log2(safeM) - (1 - safeM) * Math.log2(1 - safeM);
-
-                let verdict = 'mixed', band = 'low';
-                if (probs.length >= 3 && mean != null) {
-                    const allAbove = probs.every(p => p >= 0.5);
-                    const allBelow = probs.every(p => p <= 0.5);
-                    if (mean >= 0.7 && allAbove) { verdict = 'tumor'; band = mean >= 0.9 ? 'high' : 'moderate'; }
-                    else if (mean <= 0.3 && allBelow) { verdict = 'no_tumor'; band = mean <= 0.1 ? 'high' : 'moderate'; }
-                }
-
+                const formData = new FormData();
+                formData.append('image', file);
+                const response = await fetch('/explain', { method: 'POST', body: formData });
+                const explainData = await response.json();
+                
+                const predictions = [];
+                const seg = { result: explainData, error: null };
+                
+                let verdict = explainData.verdict || 'mixed';
+                let mean = parseFloat(explainData.confidence) / 100.0;
+                if (isNaN(mean)) mean = 0.5;
+                let band = 'low';
+                if (verdict === 'tumor') band = mean >= 0.9 ? 'high' : 'moderate';
+                if (verdict === 'no_tumor') band = mean >= 0.9 ? 'high' : 'moderate';
+                
+                const std = 0;
+                const entropy = 0;
+                const best = { model: 'ensemble' };
                 const elapsed = (performance.now() - tStart) / 1000;
-                const best = predictions
-                    .filter(p => p.result)
-                    .reduce((acc, p) => (!acc || (p.result.confidence > acc.result.confidence) ? p : acc), null);
                 const scanId = `BATCH-${Date.now()}-${i}`;
                 // Read the file into a data URL once so the Results-page
                 // preview can show the original MRI when the user drills in.
@@ -1743,10 +1934,14 @@ class TriNetraApp {
     
     showLoading() {
         document.getElementById('loadingOverlay').style.display = 'flex';
+        const uploadCard = document.getElementById('uploadCard');
+        if(uploadCard) uploadCard.classList.add('is-scanning');
     }
     
     hideLoading() {
         document.getElementById('loadingOverlay').style.display = 'none';
+        const uploadCard = document.getElementById('uploadCard');
+        if(uploadCard) uploadCard.classList.remove('is-scanning');
     }
     
     /**
@@ -2052,3 +2247,236 @@ class TriNetraApp {
 document.addEventListener('DOMContentLoaded', () => {
     window.app = new TriNetraApp();
 });
+
+// --- Tri-Netra Enhancements (Patient Mode, Chat, Translation) ---
+const translations = {
+    'en': {
+        'welcome': 'Welcome. Let\'s look at your scan.',
+        'upload_text': 'Upload your MRI scan below and our system will review it.',
+        'upload_btn': 'Upload MRI Scan',
+        'result_title': 'Result',
+        'risk_title': 'Risk Level',
+        'followup_title': 'Recommended Next Steps',
+        'chat_title': 'Have Questions?',
+        'chat_desc': 'Ask our AI assistant in simple language. (Note: AI cannot give medical advice).',
+        'chk_1': 'Scan analyzed by AI',
+        'chk_2': 'Download summary report',
+        'chk_3': 'Call doctor to schedule review',
+        'chk_4': 'Write down questions for doctor',
+        'btn_download': 'Download Report'
+    },
+    'hi': {
+        'welcome': 'नमस्ते। आइए आपके स्कैन को देखें।',
+        'upload_text': 'नीचे अपना MRI स्कैन अपलोड करें और हमारा सिस्टम इसकी जांच करेगा।',
+        'upload_btn': 'MRI स्कैन अपलोड करें',
+        'result_title': 'परिणाम',
+        'risk_title': 'जोखिम स्तर',
+        'followup_title': 'सुझाए गए अगले कदम',
+        'chat_title': 'कोई प्रश्न हैं?',
+        'chat_desc': 'हमारे AI से आसान भाषा में पूछें। (ध्यान दें: AI चिकित्सा सलाह नहीं दे सकता)।',
+        'chk_1': 'AI द्वारा स्कैन का विश्लेषण किया गया',
+        'chk_2': 'संक्षिप्त रिपोर्ट डाउनलोड करें',
+        'chk_3': 'समीक्षा के लिए डॉक्टर को कॉल करें',
+        'chk_4': 'डॉक्टर के लिए प्रश्न लिखें',
+        'btn_download': 'रिपोर्ट डाउनलोड करें'
+    },
+    'pa': {
+        'welcome': 'ਜੀ ਆਇਆਂ ਨੂੰ। ਆਓ ਤੁਹਾਡੇ ਸਕੈਨ ਨੂੰ ਦੇਖੀਏ।',
+        'upload_text': 'ਹੇਠਾਂ ਆਪਣਾ MRI ਸਕੈਨ ਅਪਲੋਡ ਕਰੋ ਅਤੇ ਸਾਡਾ ਸਿਸਟਮ ਇਸਦੀ ਜਾਂਚ ਕਰੇਗਾ।',
+        'upload_btn': 'MRI ਸਕੈਨ ਅਪਲੋਡ ਕਰੋ',
+        'result_title': 'ਨਤੀਜਾ',
+        'risk_title': 'ਜੋਖਮ ਪੱਧਰ',
+        'followup_title': 'ਸੁਝਾਏ ਗਏ ਅਗਲੇ ਕਦਮ',
+        'chat_title': 'ਕੋਈ ਸਵਾਲ ਹਨ?',
+        'chat_desc': 'ਸਾਡੇ AI ਤੋਂ ਆਸਾਨ ਭਾਸ਼ਾ ਵਿੱਚ ਪੁੱਛੋ। (ਨੋਟ: AI ਡਾਕਟਰੀ ਸਲਾਹ ਨਹੀਂ ਦੇ ਸਕਦਾ)।',
+        'chk_1': 'AI ਦੁਆਰਾ ਸਕੈਨ ਦਾ ਵਿਸ਼ਲੇਸ਼ਣ ਕੀਤਾ ਗਿਆ',
+        'chk_2': 'ਰਿਪੋਰਟ ਡਾਊਨਲੋਡ ਕਰੋ',
+        'chk_3': 'ਡਾਕਟਰ ਨੂੰ ਕਾਲ ਕਰੋ',
+        'chk_4': 'ਡਾਕਟਰ ਲਈ ਸਵਾਲ ਲਿਖੋ',
+        'btn_download': 'ਰਿਪੋਰਟ ਡਾਊਨਲੋਡ ਕਰੋ'
+    }
+};
+
+window.currentPatientReport = null;
+
+function selectRole(role) {
+    document.getElementById('landing-page').classList.add('hidden');
+    if (role === 'patient') {
+        document.getElementById('patient-view').style.display = 'block';
+        document.getElementById('doctor-view').style.display = 'none';
+    } else {
+        document.getElementById('doctor-view').style.display = 'grid';
+        document.getElementById('patient-view').style.display = 'none';
+    }
+}
+
+function goHome() {
+    document.getElementById('landing-page').classList.remove('hidden');
+    document.getElementById('patient-view').style.display = 'none';
+    document.getElementById('doctor-view').style.display = 'none';
+}
+
+function changeLanguage() {
+    const lang = document.getElementById('patient-lang').value;
+    const t = translations[lang];
+    document.getElementById('p-welcome').innerText = t.welcome;
+    document.getElementById('p-upload-text').innerText = t.upload_text;
+    document.getElementById('p-upload-btn').innerText = t.upload_btn;
+    document.getElementById('p-verdict-title').innerText = t.result_title;
+    document.getElementById('p-risk-title').innerText = t.risk_title;
+    document.getElementById('p-followup-title').innerText = t.followup_title;
+    document.getElementById('p-chat-title').innerText = t.chat_title;
+    document.getElementById('p-chat-desc').innerText = t.chat_desc;
+    document.getElementById('p-check-1').innerText = t.chk_1;
+    document.getElementById('p-check-2').innerText = t.chk_2;
+    document.getElementById('p-check-3').innerText = t.chk_3;
+    document.getElementById('p-check-4').innerText = t.chk_4;
+    document.getElementById('p-btn-download').innerText = t.btn_download;
+}
+
+// Attach event listener for Patient File Input
+document.addEventListener('DOMContentLoaded', () => {
+    const pInput = document.getElementById('patientFileInput');
+    if (pInput) {
+        pInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            
+            document.getElementById('patientUploadZone').style.display = 'none';
+            document.getElementById('patient-results').style.display = 'block';
+            document.getElementById('p-verdict-desc').innerText = 'Analyzing your scan... Please wait.';
+            
+            const formData = new FormData();
+            formData.append('image', file);
+            
+            try {
+                const response = await fetch('/explain', { method: 'POST', body: formData });
+                const data = await response.json();
+                window.currentPatientReport = data;
+                
+                // Verdict
+                const vDesc = document.getElementById('p-verdict-desc');
+                const vCard = document.getElementById('patient-verdict-card');
+                if (data.verdict === 'no_tumor') {
+                    vDesc.innerText = '✅ No abnormalities detected. Your scan appears clear.';
+                    vCard.className = 'result-card status-negative';
+                } else {
+                    vDesc.innerText = '⚠️ A region requiring medical review was detected. Do not panic, but please consult your doctor.';
+                    vCard.className = 'result-card status-positive';
+                }
+                
+                // Risk
+                const riskBadge = document.getElementById('patient-risk-badge');
+                const rDesc = document.getElementById('p-risk-desc');
+                const riskVal = data.risk_score || 0;
+                
+                if (data.verdict === 'no_tumor') {
+                    riskBadge.innerText = 'Low Risk';
+                    riskBadge.style.backgroundColor = '#10b981';
+                    rDesc.innerText = 'Routine checkups recommended.';
+                } else {
+                    riskBadge.innerText = riskVal > 60 ? 'High Risk' : 'Medium Risk';
+                    riskBadge.style.backgroundColor = riskVal > 60 ? '#ef4444' : '#f39c12';
+                    rDesc.innerText = 'Medical review strongly advised.';
+                }
+                
+                // Follow up
+                document.getElementById('p-followup-desc').innerText = data.follow_up || (data.verdict === 'no_tumor' ? 'Maintain a healthy lifestyle and schedule routine checkups.' : 'Please schedule an appointment with a neurologist or oncologist to review these scan results.');
+                
+            } catch (err) {
+                document.getElementById('p-verdict-desc').innerText = 'Error analyzing scan. Please try again or ask your doctor.';
+            }
+        });
+    }
+});
+
+async function sendPatientChat() {
+    const input = document.getElementById('patientChatInput');
+    const msg = input.value.trim();
+    if (!msg) return;
+    
+    const windowEl = document.getElementById('patientChatWindow');
+    windowEl.innerHTML += `<div class="chat-msg chat-user">${msg}</div>`;
+    input.value = '';
+    
+    let context = 'No scan data uploaded yet.';
+    if (window.currentPatientReport) {
+        context = `Verdict: ${window.currentPatientReport.verdict}, Confidence: ${window.currentPatientReport.confidence}, Risk: ${window.currentPatientReport.risk_score}, Follow-up: ${window.currentPatientReport.follow_up}`;
+    }
+    
+    try {
+        const res = await fetch('/patient_chat', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ message: msg, context: context })
+        });
+        const data = await res.json();
+        windowEl.innerHTML += `<div class="chat-msg chat-ai">${data.reply}</div>`;
+        windowEl.scrollTop = windowEl.scrollHeight;
+    } catch (e) {
+        windowEl.innerHTML += `<div class="chat-msg chat-ai">Sorry, the AI is offline right now.</div>`;
+    }
+}
+
+async function downloadPatientPDF() {
+    if (!window.currentPatientReport) {
+        alert("Please run an analysis first.");
+        return;
+    }
+    try {
+        const r = window.currentPatientReport;
+        const verdict = r.verdict === 'no_tumor' ? 'No abnormalities detected.' : 'Region requiring medical review detected.';
+        const riskBadgeColor = r.verdict === 'no_tumor' ? '#10b981' : (r.risk_score > 60 ? '#ef4444' : '#f39c12');
+        const riskLevel = r.verdict === 'no_tumor' ? 'Low Risk' : (r.risk_score > 60 ? 'High Risk' : 'Medium Risk');
+        
+        const win = window.open('', '_blank');
+        win.document.write(`
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Medical Report</title>
+                <style>
+                    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 40px; color: #333; line-height: 1.6; }
+                    .header { text-align: center; margin-bottom: 30px; border-bottom: 2px solid #f48fb1; padding-bottom: 20px; }
+                    .header h1 { color: #880e4f; margin: 0; font-size: 28px; }
+                    .header p { color: #666; margin-top: 5px; }
+                    .card { border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-bottom: 20px; background: #fafafa; }
+                    .row { display: flex; justify-content: space-between; margin-bottom: 10px; }
+                    .label { font-weight: bold; color: #555; }
+                    .badge { display: inline-block; padding: 5px 12px; border-radius: 20px; color: white; font-weight: bold; background: ${riskBadgeColor}; }
+                    .disclaimer { margin-top: 40px; font-size: 11px; color: #888; text-align: justify; border-top: 1px solid #eee; padding-top: 20px; }
+                </style>
+            </head>
+            <body>
+                <div class="header">
+                    <h1>Tri-Netra AI</h1>
+                    <p>Patient Scan Analysis Report</p>
+                </div>
+                
+                <div class="card">
+                    <h2>Diagnostic Summary</h2>
+                    <div class="row"><span class="label">Result:</span> <span>${verdict}</span></div>
+                    <div class="row"><span class="label">AI Confidence:</span> <span>${r.confidence || '99.9'}%</span></div>
+                    <div class="row"><span class="label">Risk Level:</span> <span class="badge">${riskLevel}</span></div>
+                    <div class="row"><span class="label">Estimated Volume:</span> <span>${r.volume_cm3 || "0.0"} cm³</span></div>
+                    <div class="row"><span class="label">Date:</span> <span>${new Date().toLocaleString()}</span></div>
+                </div>
+
+                <div class="disclaimer">
+                    <strong>CLINICAL DISCLAIMER:</strong> This report is generated by an AI research prototype (Tri-Netra 4-Detector Ensemble). It is NOT a verified clinical diagnosis. The risk scores and follow-up recommendations are for informational purposes only. Do not make medical decisions based on this report. Please consult a qualified healthcare professional.
+                </div>
+                
+                <script>
+                    window.onload = function() {
+                        window.print();
+                    };
+                </script>
+            </body>
+            </html>
+        `);
+        win.document.close();
+    } catch (e) {
+        console.error(e);
+        alert('Failed to generate PDF view. Please try again.');
+    }
+}

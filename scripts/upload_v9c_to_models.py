@@ -1,11 +1,11 @@
-"""Upload v9c last.pt to the HF Models repo (Tubai01/neurolens-models).
+"""Upload v9c last.pt to the HF Models repo (anannyavyas1/Tri-Netra-AI-Models).
 
 Run once after v9c training finishes. The Space pulls these weights via
 dashboard.py's _ensure_onnx_models_downloaded() when V9C_DOWNLOAD=1.
 
 Usage:
     python scripts/upload_v9c_to_models.py
-HF_TOKEN must have WRITE scope on Tubai01/neurolens-models.
+HF_TOKEN must have WRITE scope on anannyavyas1/Tri-Netra-AI-Models.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 LOCAL = ROOT / 'v9b_artifacts' / 'v9c_stage1' / 'last.pt'
-REPO_ID = 'Tubai01/neurolens-models'
+REPO_ID = 'anannyavyas1/Tri-Netra-AI-Models'
 REPO_PATH = 'v9c_stage1/last.pt'
 
 

@@ -1,4 +1,4 @@
-# NeuroLens AI - HuggingFace Spaces (Docker SDK) image.
+# Tri-Netra AI AI - HuggingFace Spaces (Docker SDK) image.
 #
 # Build target: a small public demo of the layered brain-MRI tumor pipeline.
 # Inference is ONNX-only (~430 MB total for v3 UNet + T1c specialist + 3
@@ -10,7 +10,7 @@
 #
 # Model weights are NOT bundled into this image (the HF Space free-tier 1 GB
 # repo cap is too small). dashboard.py downloads them from a separate HF
-# Model repo (default: Tubai01/neurolens-models) on first boot via
+# Model repo (default: anannyavyas1/Tri-Netra-AI-Models) on first boot via
 # huggingface_hub. See scripts/upload_models_to_hf.py for how to populate
 # that Model repo from your local .pt -> .onnx exports.
 
@@ -35,7 +35,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 # Copy application code. We intentionally do NOT copy datasets, training
 # scripts, or any model weights; only what the dashboard actually needs at
-# request time. ONNX weights are fetched from Tubai01/neurolens-models on
+# request time. ONNX weights are fetched from anannyavyas1/Tri-Netra-AI-Models on
 # first boot - see _ensure_onnx_models_downloaded() in dashboard.py.
 COPY dashboard.py /app/dashboard.py
 COPY src /app/src
@@ -66,7 +66,7 @@ ENV HF_MODEL_TEXT="meta-llama/Llama-3.3-70B-Instruct" \
 
 # Where to fetch ONNX weights from on first boot. Point at your own Model
 # repo if you forked.
-ENV HF_MODELS_REPO="Tubai01/neurolens-models"
+ENV HF_MODELS_REPO="anannyavyas1/Tri-Netra-AI-Models"
 
 EXPOSE 7860
 

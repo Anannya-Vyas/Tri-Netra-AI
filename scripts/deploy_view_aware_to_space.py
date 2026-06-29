@@ -16,7 +16,7 @@ Why it's safe:
 
 Usage:
     python scripts/deploy_view_aware_to_space.py
-HF_TOKEN env var must have WRITE scope on Tubai01/neurolens.
+HF_TOKEN env var must have WRITE scope on anannyavyas1/Tri-Netra-AI.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-REPO_ID = 'Tubai01/neurolens-ai'
+REPO_ID = 'anannyavyas1/Tri-Netra-AI'
 REPO_TYPE = 'space'
 
 # Order matters: ship the dependency BEFORE the importer.

@@ -12,9 +12,9 @@ Why this exists separately from the Space:
 
 Usage:
   # Once: create the Model repo on HF (web UI is fine):
-  #   https://huggingface.co/new -> Type: Model, Name: neurolens-models
+  #   https://huggingface.co/new -> Type: Model, Name: Tri-Netra-AI-models
   # Then run:
-  python scripts/upload_models_to_hf.py --repo Tubai01/neurolens-models
+  python scripts/upload_models_to_hf.py --repo anannyavyas1/Tri-Netra-AI-Models
   # The HF_TOKEN env var must be set to a token with WRITE scope.
 
 Re-running is safe: it only uploads files whose local sha256 differs from
@@ -67,12 +67,12 @@ CONFORMAL_DIR = ROOT / 'conformal_artifacts'
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--repo', required=True,
-                     help='HF Model repo id, e.g. Tubai01/neurolens-models')
+                     help='HF Model repo id, e.g. anannyavyas1/Tri-Netra-AI-Models')
     ap.add_argument('--token', default=None,
                      help='HF write token. Defaults to HF_TOKEN env var.')
     ap.add_argument('--create-if-missing', action='store_true',
                      help='Auto-create the Model repo if it doesn\'t exist.')
-    ap.add_argument('--commit-message', default='Upload NeuroLens ONNX models')
+    ap.add_argument('--commit-message', default='Upload Tri-Netra AI ONNX models')
     args = ap.parse_args()
 
     try:

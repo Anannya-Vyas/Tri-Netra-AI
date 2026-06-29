@@ -1,7 +1,7 @@
 import json
 import os
 import numpy as np
-import tensorflow as tf
+# removed tensorflow import
 import matplotlib
 matplotlib.use('Agg')
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score

@@ -1,7 +1,7 @@
 ---
 title: Tri-Netra — Brain Tumor Detection
-colorFrom: teal
-colorTo: emerald
+colorFrom: blue
+colorTo: indigo
 sdk: docker
 app_port: 7860
 pinned: false
@@ -26,7 +26,7 @@ Tri-Netra is a brain MRI analysis project for tumor detection, model comparison,
 
 ## Live demo
 
-Hosted on HuggingFace Spaces: [Tubai01/neurolens-ai](https://huggingface.co/spaces/Tubai01/neurolens-ai).
+Hosted on HuggingFace Spaces: [anannyavyas1/Tri-Netra-AI](https://huggingface.co/spaces/anannyavyas1/Tri-Netra-AI).
 
 > This project is for research and educational use only. It is not a medical device and should not be used as the sole basis for clinical decisions.
 
