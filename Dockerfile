@@ -38,6 +38,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 # request time. ONNX weights are fetched from anannyavyas1/Tri-Netra-AI-Models on
 # first boot - see _ensure_onnx_models_downloaded() in dashboard.py.
 COPY dashboard.py /app/dashboard.py
+COPY db.py /app/db.py
 COPY src /app/src
 COPY web_dashboard /app/web_dashboard
 # Empty per-model directories so .pt/.onnx downloads land in predictable

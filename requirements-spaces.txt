@@ -37,3 +37,4 @@ torchvision>=0.15
 transformers>=4.40
 accelerate>=0.20
 safetensors>=0.4
+psycopg2-binary>=2.9
